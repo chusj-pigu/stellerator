@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "Stellerator",
+  "project_id": "8dc902e7-c6cf-4044-8bc0-8bc9faaa9478"
+}
