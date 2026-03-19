@@ -1,5 +1,2 @@
-/target
-
-# Dolt database files (added by bd init)
-.dolt/
-*.db
+/target/
+/test_data/output/
