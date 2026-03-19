@@ -1,29 +1,29 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`Stellerator` is currently a single-crate Rust project. The crate manifest lives in `Cargo.toml`, and the application entry point is `src/main.rs`. Add new modules under `src/` and declare them from `main.rs` or `lib.rs` if the project is later split into a library and binary. Rust build artifacts are generated in `target/`; do not commit that directory.
+Stellerator is a single-crate Rust project. `Cargo.toml` defines the crate and dependencies, and `src/main.rs` is the current entry point. Add new modules under `src/` and declare them from `main.rs` or a future `lib.rs`. Put cross-module integration tests in `tests/` when they are needed. Generated build artifacts belong in `target/` and must stay out of version control.
 
 ## Build, Test, and Development Commands
-- `cargo run`: build and launch the application locally.
-- `cargo build`: compile the crate without running it.
-- `cargo test`: run unit and integration tests.
-- `cargo fmt`: format the codebase with `rustfmt`.
-- `cargo fmt -- --check`: verify formatting in CI or before opening a PR.
-- `cargo clippy --all-targets --all-features -- -D warnings`: run lint checks and fail on warnings.
+Run commands from the repository root.
 
-Use these commands from the repository root.
+- `cargo run` builds and starts the application locally.
+- `cargo build` compiles the crate without running it.
+- `cargo test` runs unit and integration tests.
+- `cargo fmt` formats the code with `rustfmt`.
+- `cargo fmt -- --check` verifies formatting for CI or pre-PR checks.
+- `cargo clippy --all-targets --all-features -- -D warnings` runs linting and treats warnings as failures.
 
 ## Coding Style & Naming Conventions
-Follow standard Rust style: 4-space indentation, one item per line when lists grow, and `snake_case` for functions, variables, and module files. Use `PascalCase` for types and traits and `SCREAMING_SNAKE_CASE` for constants. Prefer small modules with focused responsibilities. Keep public APIs explicit and document non-obvious behavior with concise `///` doc comments.
+Follow standard Rust style with 4-space indentation. Use `snake_case` for functions, variables, and module files; `PascalCase` for structs, enums, and traits; and `SCREAMING_SNAKE_CASE` for constants. Keep modules small and focused. Prefer explicit public APIs and add short `///` doc comments where behavior is not obvious.
 
 ## Testing Guidelines
-Use Rust’s built-in test framework. Place unit tests in `#[cfg(test)]` modules beside the code they cover, and add integration tests under `tests/` when behavior crosses module boundaries. Name tests for the behavior they verify, for example `parses_empty_input` or `rejects_invalid_state`. Run `cargo test` before every commit. New features should ship with tests or a clear justification for why tests are not practical yet.
+Use Rust’s built-in test framework. Keep unit tests in `#[cfg(test)]` modules beside the code they cover, and use `tests/` for behavior that spans modules. Name tests after the behavior they verify, such as `parses_empty_input` or `rejects_invalid_state`. Run `cargo test` before committing. New features should include tests unless there is a clear reason they are not practical yet.
 
 ## Commit & Pull Request Guidelines
-This repository does not have commit history yet, so establish a clean convention now: use short, imperative commit subjects such as `Add orbit calculation helper`. Keep commits focused and logically grouped. Pull requests should include a brief summary, test notes (`cargo test`, `cargo clippy`, `cargo fmt -- --check`), and any screenshots or sample output if behavior changes are user-visible.
+The visible history is minimal, so use short, imperative commit subjects such as `Add orbit calculation helper`. Keep each commit focused on one change. Pull requests should include a brief summary, linked `bd` issue, and the commands used for validation, typically `cargo test`, `cargo fmt -- --check`, and `cargo clippy --all-targets --all-features -- -D warnings`. Include sample output when behavior changes are user-visible.
 
-## Configuration & Hygiene
-Keep secrets out of the repository. Prefer environment variables for local configuration, and document any new setup requirements in `README.md` or this guide when the project grows.
+## Issue Tracking & Configuration
+Track all work in `bd`; do not add Markdown TODO lists. Check available work with `bd ready --json`, claim with `bd update <id> --claim --json`, and close completed work with `bd close <id> --reason "Completed" --json`. Keep secrets out of the repository and prefer environment variables for local configuration.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:full hash:d4f96305 -->
 ## Issue Tracking with bd (beads)
