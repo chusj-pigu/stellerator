@@ -17,6 +17,9 @@ include = [
 "images/",
 ]
 
+[[bin]]
+name = "stellerator"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
