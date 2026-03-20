@@ -2,6 +2,7 @@
 name = "Stellerator"
 version = "0.1.0"
 edition = "2024"
+description = "Extract candidate fusion-supporting reads for target genes from indexed BAM files"
 
 license = "MIT"
 readme = "README.md"
