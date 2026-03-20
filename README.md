@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="images/logo.png" alt="Stellerator logo" width="220">
-</p>
+![Stellerator Logo](images/logo.png)
 
 # Stellerator
 
