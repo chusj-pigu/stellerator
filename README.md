@@ -1,4 +1,4 @@
-![Stellerator Logo]((https://docs.rs/crate/Stellerator/latest/source/images/logo.png))
+![Stellerator Logo](https://docs.rs/crate/Stellerator/latest/source/images/logo.png)
 
 # Stellerator
 
