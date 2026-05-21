@@ -36,6 +36,15 @@ pub struct GeneSpan {
     pub transcripts: Vec<Transcript>,
 }
 
+struct AnnotationRecord {
+    reference_name: String,
+    feature_type: String,
+    start: i32,
+    end: i32,
+    strand: Option<char>,
+    attributes: BTreeMap<String, String>,
+}
+
 pub fn load_target_spans(path: &Path, requested_genes: &[String]) -> Result<Vec<GeneSpan>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open annotation file {}", path.display()))?;
@@ -46,7 +55,7 @@ pub fn load_target_spans(path: &Path, requested_genes: &[String]) -> Result<Vec<
         .collect();
     let filter_requested = !wanted.is_empty();
 
-    let mut spans: BTreeMap<(String, String), GeneSpan> = BTreeMap::new();
+    let mut records = Vec::new();
 
     for (line_number, line) in reader.lines().enumerate() {
         let line =
@@ -76,46 +85,73 @@ pub fn load_target_spans(path: &Path, requested_genes: &[String]) -> Result<Vec<
         }
 
         let attributes = parse_attributes(fields[8]);
-        let Some(matched_gene) = resolve_gene_name(&attributes, &wanted, filter_requested) else {
-            continue;
-        };
-
         let strand = match fields[6].trim() {
             "+" => Some('+'),
             "-" => Some('-'),
             _ => None,
         };
 
-        let key = (matched_gene.clone(), reference_name.to_owned());
-        let gene_span = spans.entry(key).or_insert_with(|| GeneSpan {
-            gene: matched_gene,
+        records.push(AnnotationRecord {
             reference_name: reference_name.to_owned(),
+            feature_type,
             start,
             end,
             strand,
+            attributes,
+        });
+    }
+
+    let gene_ids = gene_id_map(&records);
+    let transcript_genes = transcript_gene_map(&records, &gene_ids);
+    let mut spans: BTreeMap<(String, String), GeneSpan> = BTreeMap::new();
+
+    for record in &records {
+        let Some(matched_gene) = resolve_record_gene_name(
+            record,
+            &gene_ids,
+            &transcript_genes,
+            &wanted,
+            filter_requested,
+        ) else {
+            continue;
+        };
+
+        let key = (matched_gene.clone(), record.reference_name.clone());
+        let gene_span = spans.entry(key).or_insert_with(|| GeneSpan {
+            gene: matched_gene,
+            reference_name: record.reference_name.clone(),
+            start: record.start,
+            end: record.end,
+            strand: record.strand,
             transcripts: Vec::new(),
         });
 
-        gene_span.start = gene_span.start.min(start);
-        gene_span.end = gene_span.end.max(end);
+        gene_span.start = gene_span.start.min(record.start);
+        gene_span.end = gene_span.end.max(record.end);
         if gene_span.strand.is_none() {
-            gene_span.strand = strand;
+            gene_span.strand = record.strand;
         }
 
-        if feature_type == "exon" {
-            let transcript_id = resolve_transcript_id(&attributes)
-                .unwrap_or_else(|| format!("{}_{}_{}", gene_span.gene, start, end));
+        if record.feature_type == "exon" {
+            let transcript_id = resolve_transcript_id(&record.attributes)
+                .unwrap_or_else(|| format!("{}_{}_{}", gene_span.gene, record.start, record.end));
             let transcript = gene_span
                 .transcripts
                 .iter_mut()
                 .find(|transcript| transcript.id == transcript_id);
 
             if let Some(transcript) = transcript {
-                transcript.exons.push(Exon { start, end });
+                transcript.exons.push(Exon {
+                    start: record.start,
+                    end: record.end,
+                });
             } else {
                 gene_span.transcripts.push(Transcript {
                     id: transcript_id,
-                    exons: vec![Exon { start, end }],
+                    exons: vec![Exon {
+                        start: record.start,
+                        end: record.end,
+                    }],
                 });
             }
         }
@@ -151,6 +187,67 @@ pub fn load_target_spans(path: &Path, requested_genes: &[String]) -> Result<Vec<
     });
 
     Ok(models)
+}
+
+fn gene_id_map(records: &[AnnotationRecord]) -> BTreeMap<String, String> {
+    records
+        .iter()
+        .filter(|record| record.feature_type == "gene")
+        .filter_map(|record| {
+            let id = record.attributes.get("ID")?;
+            let name = resolve_gene_label(&record.attributes)?;
+            Some((id.clone(), name))
+        })
+        .collect()
+}
+
+fn transcript_gene_map(
+    records: &[AnnotationRecord],
+    gene_ids: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    records
+        .iter()
+        .filter(|record| matches!(record.feature_type.as_str(), "mrna" | "transcript"))
+        .filter_map(|record| {
+            let transcript_id = record.attributes.get("ID")?.clone();
+            let gene_name = resolve_direct_gene_label(&record.attributes).or_else(|| {
+                parent_ids(&record.attributes)
+                    .into_iter()
+                    .find_map(|parent| gene_ids.get(parent).cloned())
+            })?;
+            Some((transcript_id, gene_name))
+        })
+        .collect()
+}
+
+fn resolve_record_gene_name(
+    record: &AnnotationRecord,
+    gene_ids: &BTreeMap<String, String>,
+    transcript_genes: &BTreeMap<String, String>,
+    wanted: &BTreeSet<String>,
+    filter_requested: bool,
+) -> Option<String> {
+    let direct_name = if record.feature_type == "gene" {
+        resolve_gene_label(&record.attributes)
+    } else {
+        resolve_direct_gene_label(&record.attributes)
+    };
+    let name = direct_name.or_else(|| {
+        parent_ids(&record.attributes)
+            .into_iter()
+            .find_map(|parent| {
+                transcript_genes
+                    .get(parent)
+                    .or_else(|| gene_ids.get(parent))
+                    .cloned()
+            })
+    })?;
+
+    if !filter_requested || wanted.contains(&name.to_ascii_lowercase()) {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 pub fn breakpoint_annotation(span: &GeneSpan, position: usize) -> Option<BreakpointAnnotation> {
@@ -210,11 +307,22 @@ fn transcript_span_bases(transcript: &Transcript) -> i32 {
         .sum()
 }
 
+#[cfg(test)]
 fn resolve_gene_name(
     attributes: &BTreeMap<String, String>,
     wanted: &BTreeSet<String>,
     filter_requested: bool,
 ) -> Option<String> {
+    let value = resolve_gene_label(attributes)?;
+
+    if !filter_requested || wanted.contains(&value.to_ascii_lowercase()) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn resolve_gene_label(attributes: &BTreeMap<String, String>) -> Option<String> {
     const KEYS: &[&str] = &[
         "gene_name",
         "gene",
@@ -224,20 +332,30 @@ fn resolve_gene_name(
         "transcript_id",
     ];
 
-    KEYS.iter().find_map(|key| {
-        attributes.get(*key).and_then(|value| {
-            if !filter_requested || wanted.contains(&value.to_ascii_lowercase()) {
-                Some(value.clone())
-            } else {
-                None
-            }
-        })
-    })
+    KEYS.iter().find_map(|key| attributes.get(*key).cloned())
+}
+
+fn resolve_direct_gene_label(attributes: &BTreeMap<String, String>) -> Option<String> {
+    const KEYS: &[&str] = &["gene_name", "gene", "gene_id"];
+    KEYS.iter().find_map(|key| attributes.get(*key).cloned())
 }
 
 fn resolve_transcript_id(attributes: &BTreeMap<String, String>) -> Option<String> {
     const KEYS: &[&str] = &["transcript_id", "transcript", "Parent", "ID"];
     KEYS.iter().find_map(|key| attributes.get(*key).cloned())
+}
+
+fn parent_ids(attributes: &BTreeMap<String, String>) -> Vec<&str> {
+    attributes
+        .get("Parent")
+        .map(|parents| {
+            parents
+                .split(',')
+                .map(str::trim)
+                .filter(|parent| !parent.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_attributes(raw: &str) -> BTreeMap<String, String> {
@@ -522,6 +640,41 @@ chr1\tsrc\texon\t200\t250\t.\t+\t.\tgene_name \"ABL1\"; transcript_id \"tx2\";\n
         let spans = load_target_spans(&path, &[]).unwrap();
         let genes: Vec<_> = spans.iter().map(|span| span.gene.as_str()).collect();
         assert_eq!(genes, vec!["ABL1", "BCR"]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_gff3_exons_through_transcript_parent_relationships() {
+        let path = unique_test_path("hierarchy.gff3");
+        fs::write(
+            &path,
+            "\
+chr9\tsrc\tgene\t100\t500\t.\t+\t.\tID=gene-ABL1;Name=ABL1\n\
+chr9\tsrc\tmRNA\t100\t500\t.\t+\t.\tID=rna-ABL1;Parent=gene-ABL1\n\
+chr9\tsrc\texon\t100\t150\t.\t+\t.\tID=exon-ABL1-1;Parent=rna-ABL1\n\
+chr9\tsrc\texon\t300\t350\t.\t+\t.\tID=exon-ABL1-2;Parent=rna-ABL1\n",
+        )
+        .unwrap();
+
+        let spans = load_target_spans(&path, &[]).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].gene, "ABL1");
+        assert_eq!(spans[0].transcripts[0].id, "rna-ABL1");
+        assert_eq!(
+            breakpoint_annotation(&spans[0], 325),
+            Some(BreakpointAnnotation {
+                transcript_id: "rna-ABL1".to_string(),
+                region: "exon2".to_string(),
+            })
+        );
+        assert_eq!(
+            breakpoint_annotation(&spans[0], 225),
+            Some(BreakpointAnnotation {
+                transcript_id: "rna-ABL1".to_string(),
+                region: "intron1".to_string(),
+            })
+        );
 
         fs::remove_file(path).unwrap();
     }
