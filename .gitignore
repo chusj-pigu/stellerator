@@ -1,2 +1,7 @@
 /target/
 /test_data/output/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
