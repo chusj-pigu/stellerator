@@ -27,6 +27,19 @@ pub struct Args {
     pub output_tsv: PathBuf,
     #[arg(long, value_name = "FASTA_GZ", default_value = "stellerator.fasta.gz")]
     pub output_fasta: PathBuf,
+    #[arg(
+        long,
+        value_name = "VCF",
+        help = "Optional VCF output of consensus structural variants clustered from supporting reads"
+    )]
+    pub output_vcf: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "BP",
+        default_value_t = 10,
+        help = "Breakpoint clustering tolerance in bp for consensus SV calling"
+    )]
+    pub sv_slop: usize,
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub threads: usize,
     #[arg(long, action = ArgAction::SetTrue)]

@@ -146,6 +146,75 @@ fn aggregates_multiple_bams_from_directory_with_sample_provenance()
     Ok(())
 }
 
+#[test]
+fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_tsv = fixture_dir.join("stellerator.tsv");
+    let output_fasta = fixture_dir.join("stellerator.fasta.gz");
+    let output_vcf = fixture_dir.join("stellerator.vcf");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&output_tsv)
+        .arg("--output-fasta")
+        .arg(&output_fasta)
+        .arg("--output-vcf")
+        .arg(&output_vcf)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    assert!(vcf.contains("##fileformat=VCFv4.2"));
+    assert!(vcf.contains("##contig=<ID=chr22,length=1000>"));
+
+    let header_line = vcf
+        .lines()
+        .find(|line| line.starts_with("#CHROM"))
+        .expect("VCF column header");
+    assert!(header_line.ends_with("\tfusion"), "{header_line}");
+
+    let record = vcf
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .expect("a VCF record");
+    let cols: Vec<_> = record.split('\t').collect();
+    assert_eq!(cols[0], "chr22"); // query-side chromosome
+    assert_eq!(cols[3], "N"); // REF
+    assert_eq!(cols[4], "<BND>"); // ALT
+    assert_eq!(cols[6], "PASS"); // FILTER
+    assert!(cols[7].contains("SVTYPE=BND"));
+    assert!(cols[7].contains("CHR2=chr9"));
+    assert!(cols[7].contains("POS2=420"));
+    assert!(cols[7].contains("GENE1=BCR"));
+    assert!(cols[7].contains("GENE2=ABL1"));
+    assert!(cols[7].contains("SR=1"));
+    assert_eq!(cols[8], "SR"); // FORMAT
+    assert_eq!(cols[9], "1"); // supporting reads for sample 'fusion'
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,

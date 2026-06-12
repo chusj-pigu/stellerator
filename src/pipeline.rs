@@ -24,6 +24,7 @@ use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
     cli::Args,
     fasta::FastaWriter,
+    vcf::{Junction, cluster_consensus, write_vcf},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,6 +77,10 @@ pub fn run(args: Args) -> Result<()> {
 
     let tsv_writer = Arc::new(Mutex::new(create_tsv_writer(&args.output_tsv)?));
     let fasta_writer = Arc::new(Mutex::new(FastaWriter::create(&args.output_fasta)?));
+    let junctions = args
+        .output_vcf
+        .as_ref()
+        .map(|_| Mutex::new(Vec::<Junction>::new()));
 
     write_tsv_header(&tsv_writer)?;
 
@@ -92,6 +97,7 @@ pub fn run(args: Args) -> Result<()> {
             require_partner_match,
             &tsv_writer,
             &fasta_writer,
+            junctions.as_ref(),
         )
     })?;
 
@@ -113,7 +119,47 @@ pub fn run(args: Args) -> Result<()> {
         args.output_fasta.display()
     );
 
+    if let (Some(vcf_path), Some(junctions)) = (args.output_vcf.as_ref(), junctions) {
+        let junctions = junctions
+            .into_inner()
+            .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
+        let variants = cluster_consensus(junctions, args.sv_slop);
+        let sample_names = sample_names(&samples);
+        let contigs = union_contigs(&samples);
+        write_vcf(vcf_path, &variants, &sample_names, &contigs)?;
+        info!(
+            "wrote {} consensus structural variant(s) to {}",
+            variants.len(),
+            vcf_path.display()
+        );
+    }
+
     Ok(())
+}
+
+/// Deterministically ordered sample names for VCF genotype columns.
+fn sample_names(samples: &[BamSample]) -> Vec<String> {
+    let mut names: Vec<String> = samples.iter().map(|sample| sample.name.clone()).collect();
+    names.sort();
+    names
+}
+
+/// Union of reference sequences across all sample headers, in first-seen order,
+/// used to emit `##contig` lines in the VCF.
+fn union_contigs(samples: &[BamSample]) -> Vec<(String, Option<usize>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut contigs = Vec::new();
+
+    for sample in samples {
+        for (name, reference) in sample.header.reference_sequences() {
+            let name = String::from_utf8_lossy(name.as_ref()).into_owned();
+            if seen.insert(name.clone()) {
+                contigs.push((name, Some(usize::from(reference.length()))));
+            }
+        }
+    }
+
+    contigs
 }
 
 fn validate_inputs(args: &Args) -> Result<()> {
@@ -280,6 +326,7 @@ fn process_span(
     require_partner_match: bool,
     tsv_writer: &Arc<Mutex<BufWriter<File>>>,
     fasta_writer: &Arc<Mutex<FastaWriter>>,
+    junctions: Option<&Mutex<Vec<Junction>>>,
 ) -> Result<()> {
     debug!(
         sample = sample.name,
@@ -298,7 +345,7 @@ fn process_span(
     let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
         let record = result?;
-        if let Some(hit) = classify_record(
+        for hit in classify_record(
             &sample.header,
             &sample.name,
             span,
@@ -307,6 +354,12 @@ fn process_span(
             &record,
         ) {
             write_hit(tsv_writer, fasta_writer, &hit)?;
+            if let Some(collector) = junctions {
+                collector
+                    .lock()
+                    .map_err(|_| anyhow!("junction collector lock was poisoned"))?
+                    .push(hit.junction);
+            }
         }
     }
 
@@ -321,6 +374,23 @@ fn build_region(span: &GeneSpan) -> Result<Region> {
     Ok(Region::new(span.reference_name.clone(), start..=end))
 }
 
+/// Per-read fields shared across every supplementary alignment of one record.
+struct ReadContext {
+    read_name: String,
+    sequence: String,
+    read_flags: u16,
+    query_strand: char,
+    reference_name: String,
+    alignment_start: usize,
+    alignment_end: usize,
+    query_breakpoint_position: usize,
+    cigar: String,
+    mapping_quality: Option<u8>,
+    mate_reference_name: Option<String>,
+    mate_alignment_start: Option<usize>,
+    sa_tag: String,
+}
+
 fn classify_record(
     header: &sam::Header,
     sample: &str,
@@ -328,7 +398,29 @@ fn classify_record(
     partner_spans: Option<&[GeneSpan]>,
     require_partner_match: bool,
     record: &bam::Record,
-) -> Option<Hit> {
+) -> Vec<Hit> {
+    let Some(context) = read_context(header, record) else {
+        return Vec::new();
+    };
+
+    parse_sa_entries(&context.sa_tag)
+        .into_iter()
+        .filter_map(|partner| {
+            build_hit(
+                sample,
+                span,
+                partner_spans,
+                require_partner_match,
+                &context,
+                partner,
+            )
+        })
+        .collect()
+}
+
+/// Compute the per-read context, or `None` if the record cannot support a fusion
+/// call (unmapped, secondary, missing `SA` tag, or no sequence).
+fn read_context(header: &sam::Header, record: &bam::Record) -> Option<ReadContext> {
     let flags = record.flags();
     if flags.is_unmapped() || flags.is_secondary() {
         return None;
@@ -356,8 +448,39 @@ fn classify_record(
         .mate_alignment_start()
         .and_then(|position| position.ok())
         .map(usize::from);
+    let query_strand = if flags.is_reverse_complemented() {
+        '-'
+    } else {
+        '+'
+    };
 
-    let partner = parse_sa_entry(&sa_tag)?;
+    Some(ReadContext {
+        read_name,
+        sequence,
+        read_flags: flags.bits(),
+        query_strand,
+        reference_name,
+        alignment_start,
+        alignment_end,
+        query_breakpoint_position,
+        cigar,
+        mapping_quality,
+        mate_reference_name,
+        mate_alignment_start,
+        sa_tag,
+    })
+}
+
+/// Build a hit for one supplementary alignment, applying the same-gene and
+/// partner-match filters. Returns `None` when the partner does not qualify.
+fn build_hit(
+    sample: &str,
+    span: &GeneSpan,
+    partner_spans: Option<&[GeneSpan]>,
+    require_partner_match: bool,
+    context: &ReadContext,
+    partner: PartnerAlignment,
+) -> Option<Hit> {
     if partner.reference_name == span.reference_name
         && partner.start >= span.start as usize
         && partner.start <= span.end as usize
@@ -366,7 +489,8 @@ fn classify_record(
     }
 
     let matched_partner_span = partner_spans.and_then(|spans| {
-        find_overlapping_span(spans, &partner.reference_name, partner.start)
+        find_overlapping_span(spans, &partner.reference_name, partner.breakpoint)
+            .or_else(|| find_overlapping_span(spans, &partner.reference_name, partner.start))
             .filter(|partner_span| partner_span.gene != span.gene)
     });
 
@@ -374,9 +498,9 @@ fn classify_record(
         return None;
     }
 
-    let query_breakpoint = breakpoint_annotation(span, query_breakpoint_position);
+    let query_breakpoint = breakpoint_annotation(span, context.query_breakpoint_position);
     let partner_breakpoint = matched_partner_span
-        .and_then(|partner_span| breakpoint_annotation(partner_span, partner.start));
+        .and_then(|partner_span| breakpoint_annotation(partner_span, partner.breakpoint));
     let query_transcript_id = query_breakpoint
         .as_ref()
         .map(|annotation| annotation.transcript_id.clone())
@@ -396,6 +520,23 @@ fn classify_record(
     let matched_partner_gene = matched_partner_span.map(|partner_span| partner_span.gene.clone());
     let breakpoint_estimate = format!("{query_breakpoint_region}/{partner_breakpoint_region}");
 
+    let junction = Junction {
+        sample: sample.to_string(),
+        read_name: context.read_name.clone(),
+        query_gene: span.gene.clone(),
+        partner_gene: matched_partner_gene.clone(),
+        query_transcript: query_transcript_id.clone(),
+        partner_transcript: partner_transcript_id.clone(),
+        query_region: query_breakpoint_region,
+        partner_region: partner_breakpoint_region,
+        chrom1: context.reference_name.clone(),
+        pos1: context.query_breakpoint_position,
+        strand1: context.query_strand,
+        chrom2: partner.reference_name.clone(),
+        pos2: partner.breakpoint,
+        strand2: partner.strand,
+    };
+
     Some(Hit {
         tsv: TsvRecord {
             query_gene: span.gene.clone(),
@@ -403,24 +544,24 @@ fn classify_record(
             query_transcript_id: query_transcript_id.clone(),
             partner_transcript_id: partner_transcript_id.clone(),
             breakpoint_estimate: breakpoint_estimate.clone(),
-            read_name: read_name.clone(),
-            read_flags: flags.bits(),
-            reference_name,
-            alignment_start,
-            alignment_end,
-            cigar,
-            mapping_quality,
-            mate_reference_name,
-            mate_alignment_start,
+            read_name: context.read_name.clone(),
+            read_flags: context.read_flags,
+            reference_name: context.reference_name.clone(),
+            alignment_start: context.alignment_start,
+            alignment_end: context.alignment_end,
+            cigar: context.cigar.clone(),
+            mapping_quality: context.mapping_quality,
+            mate_reference_name: context.mate_reference_name.clone(),
+            mate_alignment_start: context.mate_alignment_start,
             inferred_partner_reference: partner.reference_name.clone(),
             inferred_partner_start: partner.start,
             inferred_partner_strand: partner.strand.to_string(),
-            sa_tag,
+            sa_tag: context.sa_tag.clone(),
             sample: sample.to_string(),
         },
         fasta_header: format!(
             "{} gene={} matched_partner_gene={} query_transcript_id={} partner_transcript_id={} breakpoint_estimate={} partner={}:{} strand={} sample={}",
-            read_name,
+            context.read_name,
             span.gene,
             matched_partner_gene.unwrap_or_else(|| "NA".to_string()),
             query_transcript_id,
@@ -431,7 +572,8 @@ fn classify_record(
             partner.strand,
             sample
         ),
-        fasta_sequence: sequence,
+        fasta_sequence: context.sequence.clone(),
+        junction,
     })
 }
 
@@ -542,17 +684,70 @@ fn cigar_to_string(cigar: &bam::record::Cigar<'_>) -> Result<String, std::io::Er
     Ok(rendered)
 }
 
-fn parse_sa_entry(raw: &str) -> Option<PartnerAlignment> {
-    let first = raw.split(';').find(|entry| !entry.trim().is_empty())?;
-    let mut fields = first.split(',');
-    let reference_name = fields.next()?.to_string();
-    let start = fields.next()?.parse().ok()?;
-    let strand = fields.next()?.chars().next()?;
+/// Parse every entry in an `SA` tag into a partner alignment.
+fn parse_sa_entries(raw: &str) -> Vec<PartnerAlignment> {
+    raw.split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .filter_map(parse_sa_entry)
+        .collect()
+}
+
+fn parse_sa_entry(entry: &str) -> Option<PartnerAlignment> {
+    let mut fields = entry.split(',');
+    let reference_name = fields.next()?.trim().to_string();
+    let start: usize = fields.next()?.trim().parse().ok()?;
+    let strand = fields.next()?.trim().chars().next()?;
+    let cigar = fields.next().unwrap_or("").trim();
+    let breakpoint = estimate_sa_breakpoint_position(start, cigar).unwrap_or(start);
     Some(PartnerAlignment {
         reference_name,
         start,
         strand,
+        breakpoint,
     })
+}
+
+/// Estimate the partner-side breakpoint from an `SA` CIGAR: the aligned start
+/// when the alignment is left-clipped, otherwise its aligned end. Mirrors the
+/// query-side estimate so partner exon/intron labels use a comparable position.
+fn estimate_sa_breakpoint_position(start: usize, cigar: &str) -> Option<usize> {
+    let ops = parse_cigar_ops(cigar);
+    if ops.is_empty() {
+        return None;
+    }
+
+    let reference_span: usize = ops
+        .iter()
+        .filter(|(_, kind)| matches!(kind, 'M' | 'D' | 'N' | '=' | 'X'))
+        .map(|(len, _)| *len)
+        .sum();
+    let end = start + reference_span.saturating_sub(1);
+
+    let left_clipped = matches!(ops.first()?.1, 'S' | 'H');
+    let right_clipped = matches!(ops.last()?.1, 'S' | 'H');
+
+    Some(match (left_clipped, right_clipped) {
+        (true, false) => start,
+        _ => end,
+    })
+}
+
+fn parse_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
+    let mut ops = Vec::new();
+    let mut length = String::new();
+
+    for ch in cigar.chars() {
+        if ch.is_ascii_digit() {
+            length.push(ch);
+        } else {
+            if let Ok(len) = length.parse::<usize>() {
+                ops.push((len, ch));
+            }
+            length.clear();
+        }
+    }
+
+    ops
 }
 
 fn create_tsv_writer(path: &Path) -> Result<BufWriter<File>> {
@@ -623,19 +818,22 @@ struct Hit {
     tsv: TsvRecord,
     fasta_header: String,
     fasta_sequence: String,
+    junction: Junction,
 }
 
 struct PartnerAlignment {
     reference_name: String,
     start: usize,
     strand: char,
+    breakpoint: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        check_unique_sample_names, filter_spans_by_gene_names, find_overlapping_span,
-        has_bam_extension, partner_spans, resolve_bam_inputs, sample_name,
+        check_unique_sample_names, estimate_sa_breakpoint_position, filter_spans_by_gene_names,
+        find_overlapping_span, has_bam_extension, parse_sa_entries, partner_spans,
+        resolve_bam_inputs, sample_name,
     };
     use crate::annotation::{Exon, GeneSpan, Transcript};
     use crate::cli::Args;
@@ -725,6 +923,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_sa_entry() {
+        let partners = parse_sa_entries("chr9,420,-,20S80M,60,0;chr1,100,+,30M70S,55,1;");
+        assert_eq!(partners.len(), 2);
+
+        assert_eq!(partners[0].reference_name, "chr9");
+        assert_eq!(partners[0].start, 420);
+        assert_eq!(partners[0].strand, '-');
+        // 20S80M is left-clipped, so the breakpoint sits at the aligned start.
+        assert_eq!(partners[0].breakpoint, 420);
+
+        assert_eq!(partners[1].reference_name, "chr1");
+        // 30M70S is right-clipped, so the breakpoint sits at the aligned end.
+        assert_eq!(partners[1].breakpoint, 129);
+    }
+
+    #[test]
+    fn sa_breakpoint_follows_clip_side() {
+        assert_eq!(estimate_sa_breakpoint_position(500, "40S60M"), Some(500));
+        assert_eq!(estimate_sa_breakpoint_position(500, "60M40S"), Some(559));
+        // Reference-consuming ops (D/N) extend the aligned end.
+        assert_eq!(
+            estimate_sa_breakpoint_position(500, "10M5D10M20S"),
+            Some(524)
+        );
+    }
+
+    #[test]
     fn finds_overlapping_partner_gene() {
         let spans = vec![
             GeneSpan {
@@ -792,6 +1017,8 @@ mod tests {
             partner_gene: None,
             output_tsv: PathBuf::from("out.tsv"),
             output_fasta: PathBuf::from("out.fa.gz"),
+            output_vcf: None,
+            sv_slop: 10,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -859,6 +1086,8 @@ mod tests {
             partner_gene: Some("ABL1".to_string()),
             output_tsv: PathBuf::from("out.tsv"),
             output_fasta: PathBuf::from("out.fa.gz"),
+            output_vcf: None,
+            sv_slop: 10,
             threads: 1,
             verbose: false,
             log_file: None,
