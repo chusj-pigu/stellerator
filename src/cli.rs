@@ -9,8 +9,14 @@ use clap::{ArgAction, Parser};
     about = "Extract candidate fusion-supporting reads for target genes from an indexed BAM"
 )]
 pub struct Args {
-    #[arg(long, value_name = "BAM")]
-    pub bam: PathBuf,
+    #[arg(
+        long,
+        value_name = "BAM",
+        required = true,
+        num_args = 1..,
+        help = "One or more indexed BAM files, or directories of BAMs; repeat the flag or pass multiple paths (e.g. --bam *.bam)"
+    )]
+    pub bam: Vec<PathBuf>,
     #[arg(long, value_name = "GFF_OR_GTF")]
     pub annotation: PathBuf,
     #[arg(long = "gene", value_name = "GENE", required = true, num_args = 1..)]

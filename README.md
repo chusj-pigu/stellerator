@@ -51,9 +51,30 @@ cargo run -- \
   --verbose
 ```
 
+Multiple samples in one run, via shell-expanded BAMs or a directory of BAMs:
+
+```bash
+# Several BAMs (the shell expands the glob into multiple --bam values)
+cargo run -- \
+  --bam cohort/*.bam \
+  --annotation /path/to/genes.gtf \
+  --gene BCR
+
+# A directory; every *.bam inside (each with a .bai/.csi index) is scanned
+cargo run -- \
+  --bam cohort/ \
+  --annotation /path/to/genes.gtf \
+  --gene BCR
+```
+
+All samples are aggregated into the single `--output-tsv` and `--output-fasta`,
+with a `sample` column (and `sample=` FASTA header field) recording the source
+BAM. The sample name is the BAM file stem (`cohort/lib1.bam` becomes `lib1`); a
+run aborts if two inputs would collapse to the same sample name.
+
 ## CLI Arguments
 
-- `--bam`: input BAM file
+- `--bam`: one or more indexed BAM files, or directories of BAMs; repeat the flag or pass multiple paths (e.g. `--bam *.bam`)
 - `--annotation`: input GFF3 or GTF file
 - `--gene`: target gene to query; repeat for multiple genes
 - `--partner-gene`: optional partner gene constraint
@@ -76,10 +97,11 @@ The TSV includes:
 - breakpoint estimate in `query_region/partner_region` form
 - read name, flags, coordinates, CIGAR, mapping quality, mate placement
 - inferred partner reference, position, strand, and raw `SA` tag
+- `sample` name identifying the source BAM (final column)
 
 ### FASTA
 
-The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, and inferred partner locus.
+The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
 
 ## Development
 

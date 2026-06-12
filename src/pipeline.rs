@@ -1,7 +1,8 @@
 use std::{
-    fs::File,
+    collections::HashMap,
+    fs::{self, File},
     io::{BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -45,6 +46,7 @@ struct TsvRecord {
     inferred_partner_start: usize,
     inferred_partner_strand: String,
     sa_tag: String,
+    sample: String,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -56,6 +58,9 @@ pub fn run(args: Args) -> Result<()> {
             .build_global()
             .map_err(|error| anyhow!("failed to configure rayon thread pool: {error}"))?;
     }
+
+    let samples = open_bam_samples(&args.bam)?;
+    info!("processing {} BAM sample(s)", samples.len());
 
     let requested_genes = requested_gene_names(&args);
     let annotation_genes = if args.partner_gene.is_some() {
@@ -69,17 +74,20 @@ pub fn run(args: Args) -> Result<()> {
     let require_partner_match = args.partner_gene.is_some();
     info!("loaded {} query intervals", query_spans.len());
 
-    let header = load_sam_header(&args.bam)?;
     let tsv_writer = Arc::new(Mutex::new(create_tsv_writer(&args.output_tsv)?));
     let fasta_writer = Arc::new(Mutex::new(FastaWriter::create(&args.output_fasta)?));
 
     write_tsv_header(&tsv_writer)?;
 
-    query_spans.par_iter().try_for_each(|span| {
+    let work: Vec<(&BamSample, &GeneSpan)> = samples
+        .iter()
+        .flat_map(|sample| query_spans.iter().map(move |span| (sample, span)))
+        .collect();
+
+    work.par_iter().try_for_each(|&(sample, span)| {
         process_span(
+            sample,
             span,
-            &args.bam,
-            &header,
             partner_spans.as_deref(),
             require_partner_match,
             &tsv_writer,
@@ -113,10 +121,6 @@ fn validate_inputs(args: &Args) -> Result<()> {
         bail!("--threads must be at least 1");
     }
 
-    if !args.bam.exists() {
-        bail!("BAM input does not exist: {}", args.bam.display());
-    }
-
     if !args.annotation.exists() {
         bail!(
             "annotation input does not exist: {}",
@@ -124,12 +128,120 @@ fn validate_inputs(args: &Args) -> Result<()> {
         );
     }
 
-    if !has_associated_index(&args.bam) {
-        bail!(
-            "indexed BAM required; expected {}.bai or {}.csi",
-            args.bam.display(),
-            args.bam.display()
-        );
+    Ok(())
+}
+
+/// A single indexed BAM to scan, carrying the sample name used for output
+/// provenance and its parsed header.
+struct BamSample {
+    path: PathBuf,
+    name: String,
+    header: sam::Header,
+}
+
+impl BamSample {
+    fn open(path: &Path) -> Result<Self> {
+        let header = load_sam_header(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            name: sample_name(path),
+            header,
+        })
+    }
+}
+
+/// Resolve the requested BAM inputs (files and/or directories) into a validated,
+/// deduplicated set of indexed BAMs and open each as a [`BamSample`].
+fn open_bam_samples(inputs: &[PathBuf]) -> Result<Vec<BamSample>> {
+    let paths = resolve_bam_inputs(inputs)?;
+    check_unique_sample_names(&paths)?;
+    paths.iter().map(|path| BamSample::open(path)).collect()
+}
+
+/// Expand directory inputs to their `.bam` contents, confirm every BAM exists
+/// and is indexed, then sort and deduplicate the result.
+fn resolve_bam_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut resolved: Vec<PathBuf> = Vec::new();
+
+    for input in inputs {
+        if input.is_dir() {
+            let mut found = directory_bam_files(input)?;
+            if found.is_empty() {
+                bail!("no .bam files found in directory {}", input.display());
+            }
+            resolved.append(&mut found);
+        } else if input.exists() {
+            resolved.push(input.clone());
+        } else {
+            bail!("BAM input does not exist: {}", input.display());
+        }
+    }
+
+    resolved.sort();
+    resolved.dedup();
+
+    if resolved.is_empty() {
+        bail!("no BAM inputs provided");
+    }
+
+    for path in &resolved {
+        if !has_associated_index(path) {
+            bail!(
+                "indexed BAM required; expected {path}.bai or {path}.csi",
+                path = path.display()
+            );
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// List the `.bam` files directly inside `dir`, sorted by path.
+fn directory_bam_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.is_file() && has_bam_extension(&path) {
+            files.push(path);
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn has_bam_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("bam"))
+}
+
+/// Derive the sample name for a BAM from its file stem, falling back to the
+/// full path when no stem is available.
+fn sample_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Reject input sets where two BAMs would collapse to the same sample name,
+/// which would make per-sample output provenance ambiguous.
+fn check_unique_sample_names(paths: &[PathBuf]) -> Result<()> {
+    let mut seen: HashMap<String, &Path> = HashMap::new();
+
+    for path in paths {
+        let name = sample_name(path);
+        if let Some(existing) = seen.insert(name.clone(), path) {
+            bail!(
+                "duplicate sample name {name:?} derived from {} and {}; rename one of the BAM files to disambiguate",
+                existing.display(),
+                path.display()
+            );
+        }
     }
 
     Ok(())
@@ -162,15 +274,15 @@ fn has_associated_index(bam_path: &Path) -> bool {
 }
 
 fn process_span(
+    sample: &BamSample,
     span: &GeneSpan,
-    bam_path: &Path,
-    header: &sam::Header,
     partner_spans: Option<&[GeneSpan]>,
     require_partner_match: bool,
     tsv_writer: &Arc<Mutex<BufWriter<File>>>,
     fasta_writer: &Arc<Mutex<FastaWriter>>,
 ) -> Result<()> {
     debug!(
+        sample = sample.name,
         gene = span.gene,
         reference = span.reference_name,
         start = span.start,
@@ -179,16 +291,21 @@ fn process_span(
     );
 
     let mut reader = bam::io::indexed_reader::Builder::default()
-        .build_from_path(bam_path)
-        .with_context(|| format!("failed to open indexed BAM {}", bam_path.display()))?;
+        .build_from_path(&sample.path)
+        .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
 
     let region = build_region(span)?;
-    let query = reader.query(header, &region)?;
+    let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
         let record = result?;
-        if let Some(hit) =
-            classify_record(header, span, partner_spans, require_partner_match, &record)
-        {
+        if let Some(hit) = classify_record(
+            &sample.header,
+            &sample.name,
+            span,
+            partner_spans,
+            require_partner_match,
+            &record,
+        ) {
             write_hit(tsv_writer, fasta_writer, &hit)?;
         }
     }
@@ -206,6 +323,7 @@ fn build_region(span: &GeneSpan) -> Result<Region> {
 
 fn classify_record(
     header: &sam::Header,
+    sample: &str,
     span: &GeneSpan,
     partner_spans: Option<&[GeneSpan]>,
     require_partner_match: bool,
@@ -298,9 +416,10 @@ fn classify_record(
             inferred_partner_start: partner.start,
             inferred_partner_strand: partner.strand.to_string(),
             sa_tag,
+            sample: sample.to_string(),
         },
         fasta_header: format!(
-            "{} gene={} matched_partner_gene={} query_transcript_id={} partner_transcript_id={} breakpoint_estimate={} partner={}:{} strand={}",
+            "{} gene={} matched_partner_gene={} query_transcript_id={} partner_transcript_id={} breakpoint_estimate={} partner={}:{} strand={} sample={}",
             read_name,
             span.gene,
             matched_partner_gene.unwrap_or_else(|| "NA".to_string()),
@@ -309,7 +428,8 @@ fn classify_record(
             breakpoint_estimate,
             partner.reference_name,
             partner.start,
-            partner.strand
+            partner.strand,
+            sample
         ),
         fasta_sequence: sequence,
     })
@@ -447,7 +567,7 @@ fn write_tsv_header(writer: &Arc<Mutex<BufWriter<File>>>) -> Result<()> {
         .map_err(|_| anyhow!("TSV writer lock was poisoned"))?;
     writeln!(
         writer,
-        "query_gene\tmatched_partner_gene\tquery_transcript_id\tpartner_transcript_id\tbreakpoint_estimate\tread_name\tread_flags\treference_name\talignment_start\talignment_end\tcigar\tmapping_quality\tmate_reference_name\tmate_alignment_start\tinferred_partner_reference\tinferred_partner_start\tinferred_partner_strand\tsa_tag"
+        "query_gene\tmatched_partner_gene\tquery_transcript_id\tpartner_transcript_id\tbreakpoint_estimate\tread_name\tread_flags\treference_name\talignment_start\talignment_end\tcigar\tmapping_quality\tmate_reference_name\tmate_alignment_start\tinferred_partner_reference\tinferred_partner_start\tinferred_partner_strand\tsa_tag\tsample"
     )?;
     Ok(())
 }
@@ -463,7 +583,7 @@ fn write_hit(
             .map_err(|_| anyhow!("TSV writer lock was poisoned"))?;
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             hit.tsv.query_gene,
             hit.tsv.matched_partner_gene.clone().unwrap_or_default(),
             hit.tsv.query_transcript_id,
@@ -487,7 +607,8 @@ fn write_hit(
             hit.tsv.inferred_partner_reference,
             hit.tsv.inferred_partner_start,
             hit.tsv.inferred_partner_strand,
-            hit.tsv.sa_tag
+            hit.tsv.sa_tag,
+            hit.tsv.sample
         )?;
     }
 
@@ -512,10 +633,96 @@ struct PartnerAlignment {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_spans_by_gene_names, find_overlapping_span, partner_spans};
+    use super::{
+        check_unique_sample_names, filter_spans_by_gene_names, find_overlapping_span,
+        has_bam_extension, partner_spans, resolve_bam_inputs, sample_name,
+    };
     use crate::annotation::{Exon, GeneSpan, Transcript};
     use crate::cli::Args;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("stellerator_unit_{nanos}_{suffix}"));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sample_name_uses_file_stem() {
+        assert_eq!(sample_name(Path::new("/data/sampleA.bam")), "sampleA");
+        assert_eq!(
+            sample_name(Path::new("/data/sampleA.sorted.bam")),
+            "sampleA.sorted"
+        );
+    }
+
+    #[test]
+    fn has_bam_extension_is_case_insensitive() {
+        assert!(has_bam_extension(Path::new("a.bam")));
+        assert!(has_bam_extension(Path::new("a.BAM")));
+        assert!(!has_bam_extension(Path::new("a.bai")));
+        assert!(!has_bam_extension(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn check_unique_sample_names_detects_collisions() {
+        let colliding = [
+            PathBuf::from("/a/sample.bam"),
+            PathBuf::from("/b/sample.bam"),
+        ];
+        let error = check_unique_sample_names(&colliding).unwrap_err();
+        assert!(error.to_string().contains("duplicate sample name"));
+
+        let distinct = [PathBuf::from("/a/one.bam"), PathBuf::from("/b/two.bam")];
+        assert!(check_unique_sample_names(&distinct).is_ok());
+    }
+
+    #[test]
+    fn resolve_bam_inputs_requires_index() {
+        let dir = unique_temp_dir();
+        let bam = dir.join("a.bam");
+        std::fs::write(&bam, b"").unwrap();
+
+        let error = resolve_bam_inputs(std::slice::from_ref(&bam)).unwrap_err();
+        assert!(error.to_string().contains("indexed BAM required"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_bam_inputs_expands_directory_and_dedups() {
+        let dir = unique_temp_dir();
+        for name in ["b.bam", "a.bam"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+            std::fs::write(dir.join(format!("{name}.bai")), b"").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"").unwrap();
+
+        // Directory plus an explicit duplicate of one of its BAMs.
+        let resolved = resolve_bam_inputs(&[dir.clone(), dir.join("a.bam")]).unwrap();
+        let names: Vec<_> = resolved
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.bam", "b.bam"]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_bam_inputs_rejects_empty_directory() {
+        let dir = unique_temp_dir();
+        let error = resolve_bam_inputs(std::slice::from_ref(&dir)).unwrap_err();
+        assert!(error.to_string().contains("no .bam files found"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn finds_overlapping_partner_gene() {
@@ -579,7 +786,7 @@ mod tests {
         ];
 
         let args = Args {
-            bam: PathBuf::from("sample.bam"),
+            bam: vec![PathBuf::from("sample.bam")],
             annotation: PathBuf::from("genes.gtf"),
             genes: vec!["BCR".to_string()],
             partner_gene: None,
@@ -646,7 +853,7 @@ mod tests {
         ];
 
         let args = Args {
-            bam: PathBuf::from("sample.bam"),
+            bam: vec![PathBuf::from("sample.bam")],
             annotation: PathBuf::from("genes.gtf"),
             genes: vec!["BCR".to_string()],
             partner_gene: Some("ABL1".to_string()),

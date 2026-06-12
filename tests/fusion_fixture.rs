@@ -32,7 +32,7 @@ fn extracts_fusion_read_and_infers_partner_annotation() -> Result<(), Box<dyn st
     let output_fasta = fixture_dir.join("stellerator.fasta.gz");
 
     write_annotation(&annotation_path)?;
-    write_indexed_bam(&bam_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
         .arg("--bam")
@@ -71,13 +71,76 @@ fn extracts_fusion_read_and_infers_partner_annotation() -> Result<(), Box<dyn st
     assert_eq!(values[14], "chr9");
     assert_eq!(values[15], "420");
     assert_eq!(values[16], "-");
+    assert_eq!(values[18], "fusion");
 
     let fasta = read_gzip_to_string(&output_fasta)?;
     assert!(fasta.contains(">fusion-read-1 gene=BCR matched_partner_gene=ABL1"));
     assert!(fasta.contains("partner_transcript_id=txABL1"));
     assert!(fasta.contains("breakpoint_estimate=exon1/exon1"));
     assert!(fasta.contains("partner=chr9:420 strand=-"));
+    assert!(fasta.contains("sample=fusion"));
     assert!(fasta.contains("ACGTACGTACGT"));
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn aggregates_multiple_bams_from_directory_with_sample_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_dir = fixture_dir.join("bams");
+    fs::create_dir(&bam_dir)?;
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_tsv = fixture_dir.join("stellerator.tsv");
+    let output_fasta = fixture_dir.join("stellerator.fasta.gz");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_dir.join("sampleA.bam"), "read-A")?;
+    write_indexed_bam(&bam_dir.join("sampleB.bam"), "read-B")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_dir)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&output_tsv)
+        .arg("--output-fasta")
+        .arg(&output_fasta)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tsv = fs::read_to_string(&output_tsv)?;
+    let rows: Vec<_> = tsv.lines().collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected header plus one row per sample\n{tsv}"
+    );
+
+    let mut samples: Vec<&str> = rows[1..]
+        .iter()
+        .map(|row| row.split('\t').next_back().unwrap())
+        .collect();
+    samples.sort_unstable();
+    assert_eq!(samples, vec!["sampleA", "sampleB"]);
+
+    let fasta = read_gzip_to_string(&output_fasta)?;
+    assert!(fasta.contains(">read-A gene=BCR"));
+    assert!(fasta.contains(">read-B gene=BCR"));
+    assert!(fasta.contains("sample=sampleA"));
+    assert!(fasta.contains("sample=sampleB"));
 
     fs::remove_dir_all(fixture_dir)?;
     Ok(())
@@ -101,7 +164,7 @@ chr9\tstellerator\texon\t400\t450\t.\t-\t.\tID=exon-ABL1-2;Parent=txABL1
     Ok(())
 }
 
-fn write_indexed_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let header: sam::Header = "\
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr9\tLN:1000
@@ -121,7 +184,7 @@ fn write_indexed_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     .collect();
 
     let record = RecordBuf::builder()
-        .set_name("fusion-read-1")
+        .set_name(read_name)
         .set_flags(Flags::empty())
         .set_reference_sequence_id(1)
         .set_alignment_start(Position::try_from(120)?)
