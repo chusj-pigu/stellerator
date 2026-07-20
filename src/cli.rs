@@ -55,6 +55,12 @@ pub struct Args {
         help = "Include reads flagged as PCR/optical duplicates; they are skipped by default"
     )]
     pub include_duplicates: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Also report discordant read pairs whose mate maps outside the queried gene; split reads only by default"
+    )]
+    pub include_discordant: bool,
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub threads: usize,
     #[arg(long, action = ArgAction::SetTrue)]

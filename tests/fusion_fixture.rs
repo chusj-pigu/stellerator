@@ -129,9 +129,14 @@ fn aggregates_multiple_bams_from_directory_with_sample_provenance()
         "expected header plus one row per sample\n{tsv}"
     );
 
+    let header: Vec<&str> = rows[0].split('\t').collect();
+    let sample_column = header
+        .iter()
+        .position(|column| *column == "sample")
+        .expect("sample column");
     let mut samples: Vec<&str> = rows[1..]
         .iter()
-        .map(|row| row.split('\t').next_back().unwrap())
+        .map(|row| row.split('\t').nth(sample_column).unwrap())
         .collect();
     samples.sort_unstable();
     assert_eq!(samples, vec!["sampleA", "sampleB"]);
@@ -207,9 +212,10 @@ fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
     assert!(cols[7].contains("POS2=420"));
     assert!(cols[7].contains("GENE1=BCR"));
     assert!(cols[7].contains("GENE2=ABL1"));
-    assert!(cols[7].contains("SR=1"));
-    assert_eq!(cols[8], "SR"); // FORMAT
-    assert_eq!(cols[9], "1"); // supporting reads for sample 'fusion'
+    assert!(cols[7].contains("SR=1")); // one split read
+    assert!(cols[7].contains("PE=0")); // no discordant support
+    assert_eq!(cols[8], "SR:PE"); // FORMAT
+    assert_eq!(cols[9], "1:0"); // split:discordant for sample 'fusion'
 
     fs::remove_dir_all(fixture_dir)?;
     Ok(())
@@ -360,6 +366,58 @@ fn skips_duplicate_flagged_reads_unless_included() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[test]
+fn reports_discordant_pairs_only_when_requested() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("discordant.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_discordant_bam(&bam_path, "discordant-read")?;
+
+    // The read has no SA tag, so split-read scanning alone finds nothing.
+    let default_tsv = fixture_dir.join("default.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &default_tsv,
+        &fixture_dir.join("default.fasta.gz"),
+        &[],
+    )?;
+    let tsv = fs::read_to_string(&default_tsv)?;
+    assert_eq!(tsv.lines().count(), 1, "expected header only\n{tsv}");
+
+    // Opting in surfaces the pair, annotated against the mate's locus.
+    let discordant_tsv = fixture_dir.join("discordant.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &discordant_tsv,
+        &fixture_dir.join("discordant.fasta.gz"),
+        &["--include-discordant"],
+    )?;
+    let tsv = fs::read_to_string(&discordant_tsv)?;
+    let rows: Vec<&str> = tsv.lines().collect();
+    assert_eq!(rows.len(), 2, "expected header + 1 row\n{tsv}");
+
+    let header: Vec<&str> = rows[0].split('\t').collect();
+    let values: Vec<&str> = rows[1].split('\t').collect();
+    let column = |name: &str| values[header.iter().position(|c| *c == name).expect(name)];
+
+    assert_eq!(column("read_name"), "discordant-read");
+    assert_eq!(column("evidence"), "discordant");
+    assert_eq!(column("query_gene"), "BCR");
+    // The mate lands in ABL1, so the partner is annotated from mate placement.
+    assert_eq!(column("matched_partner_gene"), "ABL1");
+    assert_eq!(column("inferred_partner_reference"), "chr9");
+    assert_eq!(column("inferred_partner_start"), "420");
+    // No SA tag backs a discordant call.
+    assert_eq!(column("sa_tag"), "");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -426,6 +484,47 @@ fn write_indexed_bam_reads(
         writer.write_alignment_record(&header, &record)?;
     }
 
+    writer.try_finish()?;
+
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM holding a single paired read that sits in BCR, carries
+/// no `SA` tag, and whose mate maps into ABL1: discordant-pair evidence only.
+fn write_indexed_discordant_bam(
+    path: &Path,
+    read_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
+
+    let sequence = "ACGT".repeat(25);
+    let cigar: Cigar = [Op::new(Kind::Match, 100)].into_iter().collect();
+
+    let record = RecordBuf::builder()
+        .set_name(read_name)
+        .set_flags(Flags::SEGMENTED)
+        .set_reference_sequence_id(1)
+        .set_alignment_start(Position::try_from(120)?)
+        .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+        .set_cigar(cigar)
+        .set_sequence(Sequence::from(sequence.as_bytes()))
+        .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+        .set_mate_reference_sequence_id(0)
+        .set_mate_alignment_start(Position::try_from(420)?)
+        .build();
+
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+    writer.write_alignment_record(&header, &record)?;
     writer.try_finish()?;
 
     let index = bam::fs::index(path)?;

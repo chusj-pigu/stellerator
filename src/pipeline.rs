@@ -24,7 +24,7 @@ use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
     cli::Args,
     fasta::FastaWriter,
-    vcf::{Junction, cluster_consensus, write_vcf},
+    vcf::{Evidence, Junction, cluster_consensus, write_vcf},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +48,7 @@ struct TsvRecord {
     inferred_partner_strand: String,
     sa_tag: String,
     sample: String,
+    evidence: String,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -488,19 +489,21 @@ struct ReadContext {
     mapping_quality: Option<u8>,
     mate_reference_name: Option<String>,
     mate_alignment_start: Option<usize>,
-    sa_tag: String,
+    sa_tag: Option<String>,
 }
 
 /// Read-filtering options applied to every scanned record.
 #[derive(Debug, Clone, Copy)]
 struct ScanOptions {
     include_duplicates: bool,
+    include_discordant: bool,
 }
 
 impl ScanOptions {
     fn from_args(args: &Args) -> Self {
         Self {
             include_duplicates: args.include_duplicates,
+            include_discordant: args.include_discordant,
         }
     }
 }
@@ -518,7 +521,11 @@ fn classify_record(
         return Vec::new();
     };
 
-    parse_sa_entries(&context.sa_tag)
+    let mut hits: Vec<Hit> = context
+        .sa_tag
+        .as_deref()
+        .map(parse_sa_entries)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|partner| {
             build_hit(
@@ -528,9 +535,60 @@ fn classify_record(
                 require_partner_match,
                 &context,
                 partner,
+                Evidence::Split,
             )
         })
-        .collect()
+        .collect();
+
+    if options.include_discordant
+        && let Some(partner) = discordant_partner(&context, span)
+        && let Some(hit) = build_hit(
+            sample,
+            span,
+            partner_spans,
+            require_partner_match,
+            &context,
+            partner,
+            Evidence::Discordant,
+        )
+    {
+        hits.push(hit);
+    }
+
+    hits
+}
+
+/// Build a partner alignment from the mate placement when the mate maps outside
+/// the queried gene interval, which is discordant-pair evidence for a fusion.
+fn discordant_partner(context: &ReadContext, span: &GeneSpan) -> Option<PartnerAlignment> {
+    let flags = sam::alignment::record::Flags::from(context.read_flags);
+    if !flags.is_segmented() || flags.is_mate_unmapped() {
+        return None;
+    }
+
+    let reference_name = context.mate_reference_name.clone()?;
+    let start = context.mate_alignment_start?;
+
+    // A mate landing inside the queried interval is an ordinary concordant pair.
+    if reference_name == span.reference_name
+        && start >= span.start as usize
+        && start <= span.end as usize
+    {
+        return None;
+    }
+
+    Some(PartnerAlignment {
+        reference_name,
+        start,
+        strand: if flags.is_mate_reverse_complemented() {
+            '-'
+        } else {
+            '+'
+        },
+        // Without the mate's CIGAR its alignment start is the best available
+        // breakpoint estimate, so discordant calls are inherently coarser.
+        breakpoint: start,
+    })
 }
 
 /// Compute the per-read context, or `None` if the record cannot support a fusion
@@ -551,7 +609,13 @@ fn read_context(
         return None;
     }
 
-    let sa_tag = extract_sa(record)?;
+    // Split reads need an SA tag; without one the record is only interesting
+    // when discordant-pair evidence is being collected.
+    let sa_tag = extract_sa(record);
+    if sa_tag.is_none() && !options.include_discordant {
+        return None;
+    }
+
     let read_name = String::from_utf8_lossy(record.name()?.as_ref()).into_owned();
     let sequence: String = record.sequence().iter().map(char::from).collect();
     if sequence.is_empty() {
@@ -605,6 +669,7 @@ fn build_hit(
     require_partner_match: bool,
     context: &ReadContext,
     partner: PartnerAlignment,
+    evidence: Evidence,
 ) -> Option<Hit> {
     if partner.reference_name == span.reference_name
         && partner.start >= span.start as usize
@@ -648,6 +713,7 @@ fn build_hit(
     let junction = Junction {
         sample: sample.to_string(),
         read_name: context.read_name.clone(),
+        evidence,
         query_gene: span.gene.clone(),
         partner_gene: matched_partner_gene.clone(),
         query_transcript: query_transcript_id.clone(),
@@ -681,11 +747,12 @@ fn build_hit(
             inferred_partner_reference: partner.reference_name.clone(),
             inferred_partner_start: partner.start,
             inferred_partner_strand: partner.strand.to_string(),
-            sa_tag: context.sa_tag.clone(),
+            sa_tag: context.sa_tag.clone().unwrap_or_default(),
             sample: sample.to_string(),
+            evidence: evidence.as_str().to_string(),
         },
         fasta_header: format!(
-            "{} gene={} matched_partner_gene={} query_transcript_id={} partner_transcript_id={} breakpoint_estimate={} partner={}:{} strand={} sample={}",
+            "{} gene={} matched_partner_gene={} query_transcript_id={} partner_transcript_id={} breakpoint_estimate={} partner={}:{} strand={} sample={} evidence={}",
             context.read_name,
             span.gene,
             matched_partner_gene.unwrap_or_else(|| "NA".to_string()),
@@ -695,7 +762,8 @@ fn build_hit(
             partner.reference_name,
             partner.start,
             partner.strand,
-            sample
+            sample,
+            evidence.as_str()
         ),
         fasta_sequence: context.sequence.clone(),
         junction,
@@ -887,7 +955,7 @@ fn write_tsv_header(writer: &Arc<Mutex<BufWriter<File>>>) -> Result<()> {
         .map_err(|_| anyhow!("TSV writer lock was poisoned"))?;
     writeln!(
         writer,
-        "query_gene\tmatched_partner_gene\tquery_transcript_id\tpartner_transcript_id\tbreakpoint_estimate\tread_name\tread_flags\treference_name\talignment_start\talignment_end\tcigar\tmapping_quality\tmate_reference_name\tmate_alignment_start\tinferred_partner_reference\tinferred_partner_start\tinferred_partner_strand\tsa_tag\tsample"
+        "query_gene\tmatched_partner_gene\tquery_transcript_id\tpartner_transcript_id\tbreakpoint_estimate\tread_name\tread_flags\treference_name\talignment_start\talignment_end\tcigar\tmapping_quality\tmate_reference_name\tmate_alignment_start\tinferred_partner_reference\tinferred_partner_start\tinferred_partner_strand\tsa_tag\tsample\tevidence"
     )?;
     Ok(())
 }
@@ -903,7 +971,7 @@ fn write_hit(
             .map_err(|_| anyhow!("TSV writer lock was poisoned"))?;
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             hit.tsv.query_gene,
             hit.tsv.matched_partner_gene.clone().unwrap_or_default(),
             hit.tsv.query_transcript_id,
@@ -928,7 +996,8 @@ fn write_hit(
             hit.tsv.inferred_partner_start,
             hit.tsv.inferred_partner_strand,
             hit.tsv.sa_tag,
-            hit.tsv.sample
+            hit.tsv.sample,
+            hit.tsv.evidence
         )?;
     }
 
@@ -1217,6 +1286,7 @@ mod tests {
             output_vcf: None,
             sv_slop: 10,
             include_duplicates: false,
+            include_discordant: false,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1287,6 +1357,7 @@ mod tests {
             output_vcf: None,
             sv_slop: 10,
             include_duplicates: false,
+            include_discordant: false,
             threads: 1,
             verbose: false,
             log_file: None,

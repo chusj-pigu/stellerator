@@ -6,10 +6,13 @@ Stellerator is a Rust command-line tool for extracting candidate fusion-supporti
 
 ## What It Does
 
-- Queries indexed BAM alignments across the requested gene interval(s)
-- Uses supplementary alignments to identify candidate split-read evidence
+- Queries indexed BAM alignments across the requested gene interval(s), across one or more BAMs
+- Uses every supplementary alignment in the `SA` tag to identify candidate split-read evidence
+- Optionally adds discordant read-pair evidence inferred from mate placement
+- Skips reads flagged as PCR/optical duplicates
 - Writes a TSV summary of candidate reads and inferred partner loci
 - Writes a gzipped FASTA file containing the supporting read sequences
+- Optionally emits a multi-sample VCF of consensus structural variants with per-sample support
 - Annotates breakpoint regions as exon or intron labels using the longest transcript model per gene
 - When `--partner-gene` is omitted, annotates supplementary loci against overlapping features from the annotation file when available
 
@@ -94,6 +97,7 @@ cargo run -- \
 - `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use `<bam-basename>.<genes>.vcf`; omit the flag entirely to skip the VCF
 - `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
 - `--include-duplicates`: include reads flagged as PCR/optical duplicates; they are skipped by default
+- `--include-discordant`: also report discordant read pairs whose mate maps outside the queried gene; split reads only by default
 - `--threads`: rayon worker count
 - `--verbose`: enable debug logging
 - `--log-file`: optional log file path
@@ -132,11 +136,12 @@ The TSV includes:
 - breakpoint estimate in `query_region/partner_region` form
 - read name, flags, coordinates, CIGAR, mapping quality, mate placement
 - inferred partner reference, position, strand, and raw `SA` tag
-- `sample` name identifying the source BAM (final column)
+- `sample` name identifying the source BAM
+- `evidence` class for the row: `split` (from an `SA` alignment) or `discordant` (from mate placement)
 
 ### FASTA
 
-The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
+The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, the source `sample` name, and the `evidence` class.
 
 ### VCF
 
@@ -149,9 +154,14 @@ are merged into one call. Each record is a `BND` breakend with:
 - `CHROM`/`POS`: consensus query-side breakpoint (median of supporting reads)
 - `INFO`: `SVTYPE=BND`, mate locus (`CHR2`/`POS2`), `STRANDS`, gene annotations
   (`GENE1`/`GENE2`), transcripts used for labeling, breakpoint `REGION` labels,
-  and total supporting reads (`SR`)
-- one genotype column per sample with the per-sample supporting-read count
-  (`FORMAT/SR`)
+  and support counts split by evidence class — `SR` (split reads) and `PE`
+  (discordant pairs)
+- one genotype column per sample, `FORMAT/SR:PE`, carrying that sample's split
+  and discordant support
+
+`PE` counts are zero unless `--include-discordant` is given. A read is counted
+once per evidence class, so a read that is both split and discordant adds one to
+each tally rather than two to a combined total.
 
 ## Development
 
