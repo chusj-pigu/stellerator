@@ -160,7 +160,29 @@ are merged into one call. Each record is a `BND` breakend with:
 - `INFO`: `SVTYPE=BND`, mate locus (`CHR2`/`POS2`), `STRANDS`, gene annotations
   (`GENE1`/`GENE2`), transcripts used for labeling, breakpoint `REGION` labels,
   and cohort-wide support (`SR`), depth (`DP`) and allele fraction (`AF`)
+- `CIPOS`/`CIPOS2`: offsets from `POS`/`POS2` to the lowest and highest
+  supporting breakpoint in the cluster, so the observed scatter is visible
 - one genotype column per sample, `FORMAT/GT:DP:AD:AF:SR`
+
+#### Choosing `--sv-slop`
+
+Reads spanning one junction never agree exactly on where it falls: aligners
+place the boundary differently depending on read errors and local sequence.
+`--sv-slop` is the window that merges those near-identical breakends into a
+single call — two breakends join when they share both chromosomes and strands
+and each coordinate is within the tolerance of the cluster anchor.
+
+Set it too tight and one real event fragments into several calls, each holding a
+fraction of the support; too loose and genuinely distinct junctions get merged.
+The first failure mode is the dangerous one for low-frequency work, where there
+are no spare reads to lose.
+
+`CIPOS`/`CIPOS2` exist to make this measurable rather than guesswork. Run once
+with a deliberately generous `--sv-slop` so a real event stays in one cluster,
+then read the width of `CIPOS` to see how far breakpoints actually scatter in
+your data, and set the tolerance from that. For example, three reads of one
+junction scattering 11 bp report `CIPOS=-5,6` under `--sv-slop 100`, but split
+into a 2-read and a 1-read call under the default `--sv-slop 10`.
 
 #### Allele fraction and low-frequency fusions
 

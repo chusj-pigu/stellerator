@@ -42,6 +42,11 @@ pub struct StructuralVariant {
     pub transcript1: String,
     pub transcript2: String,
     pub region: String,
+    /// Lowest and highest query breakpoint among the supporting reads, showing
+    /// how far the cluster actually scattered.
+    pub pos1_range: (usize, usize),
+    /// Lowest and highest partner breakpoint among the supporting reads.
+    pub pos2_range: (usize, usize),
     pub support_total: usize,
     pub support_by_sample: BTreeMap<String, usize>,
     /// Reads spanning the consensus breakpoint per sample, filled in after
@@ -171,10 +176,29 @@ fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
         transcript1: anchor.query_transcript.clone(),
         transcript2: anchor.partner_transcript.clone(),
         region: format!("{}/{}", anchor.query_region, anchor.partner_region),
+        pos1_range: position_range(cluster.iter().map(|junction| junction.pos1)),
+        pos2_range: position_range(cluster.iter().map(|junction| junction.pos2)),
         support_total: seen.len(),
         support_by_sample,
         depth_by_sample: BTreeMap::new(),
     }
+}
+
+/// Lowest and highest value in a cluster, used to expose breakpoint scatter.
+fn position_range(values: impl Iterator<Item = usize>) -> (usize, usize) {
+    let values: Vec<usize> = values.collect();
+    let low = values.iter().copied().min().unwrap_or(0);
+    let high = values.iter().copied().max().unwrap_or(0);
+    (low, high)
+}
+
+/// Offsets from an anchor position to the ends of a range, as VCF confidence
+/// intervals are expressed relative to the reported position.
+fn range_offsets(anchor: usize, range: (usize, usize)) -> (i64, i64) {
+    (
+        range.0 as i64 - anchor as i64,
+        range.1 as i64 - anchor as i64,
+    )
 }
 
 fn median(values: impl Iterator<Item = usize>) -> usize {
@@ -249,6 +273,14 @@ pub fn write_vcf(
     )?;
     writeln!(
         writer,
+        "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Offsets from POS to the lowest and highest supporting breakpoint in the cluster; the width shows the observed breakpoint scatter\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=CIPOS2,Number=2,Type=Integer,Description=\"Offsets from POS2 to the lowest and highest supporting partner breakpoint in the cluster\">"
+    )?;
+    writeln!(
+        writer,
         "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Reads spanning the breakend across all samples\">"
     )?;
     writeln!(
@@ -305,8 +337,10 @@ pub fn write_vcf(
             variant.region,
             variant.support_total,
         );
+        let (cipos_low, cipos_high) = range_offsets(variant.pos1, variant.pos1_range);
+        let (cipos2_low, cipos2_high) = range_offsets(variant.pos2, variant.pos2_range);
         let info = format!(
-            "{info};DP={};AF={:.6}",
+            "{info};CIPOS={cipos_low},{cipos_high};CIPOS2={cipos2_low},{cipos2_high};DP={};AF={:.6}",
             variant.total_depth(),
             variant.total_allele_fraction()
         );
@@ -381,6 +415,13 @@ mod tests {
         assert_eq!(variant.gene2, "ABL1");
         assert_eq!(variant.pos1, 101);
         assert_eq!(variant.pos2, 401);
+
+        // The scatter of the member breakpoints is retained, so a generous
+        // --sv-slop reveals how wide real clusters are.
+        assert_eq!(variant.pos1_range, (100, 103));
+        assert_eq!(variant.pos2_range, (400, 402));
+        assert_eq!(range_offsets(variant.pos1, variant.pos1_range), (-1, 2));
+        assert_eq!(range_offsets(variant.pos2, variant.pos2_range), (-1, 1));
     }
 
     #[test]
