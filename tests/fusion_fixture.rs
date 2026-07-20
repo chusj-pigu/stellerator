@@ -527,6 +527,46 @@ fn scattered_cluster_reports_consistent_depth_and_scatter() -> Result<(), Box<dy
     Ok(())
 }
 
+#[test]
+fn writes_one_fasta_record_per_read_across_multiple_sa_entries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("chimeric.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_tsv = fixture_dir.join("chimeric.tsv");
+    let output_fasta = fixture_dir.join("chimeric.fasta.gz");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_multi_sa_bam(&bam_path, "chimeric-read")?;
+
+    run_extract(&bam_path, &annotation_path, &output_tsv, &output_fasta, &[])?;
+
+    // One row per supplementary alignment: the junction detail is preserved.
+    let tsv = fs::read_to_string(&output_tsv)?;
+    assert_eq!(tsv.lines().count(), 3, "expected header + 2 rows\n{tsv}");
+    assert_eq!(tsv.matches("chimeric-read").count(), 2, "{tsv}");
+
+    // ...but the sequence is written once, not once per junction.
+    let fasta = read_gzip_to_string(&output_fasta)?;
+    assert_eq!(
+        fasta.matches('>').count(),
+        1,
+        "expected a single FASTA record\n{fasta}"
+    );
+    // Exactly one sequence line, so the read is not emitted once per junction.
+    let sequence_lines = fasta
+        .lines()
+        .filter(|line| !line.starts_with('>') && !line.is_empty())
+        .count();
+    assert_eq!(
+        sequence_lines, 1,
+        "read sequence must not be duplicated\n{fasta}"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -710,6 +750,54 @@ fn write_indexed_scattered_bam(path: &Path) -> Result<(), Box<dyn std::error::Er
     }
 
     writer.try_finish()?;
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM holding one read whose `SA` tag lists two supplementary
+/// alignments, as a chimeric long read would.
+fn write_indexed_multi_sa_bam(
+    path: &Path,
+    read_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
+
+    let sequence = "ACGT".repeat(25);
+    let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+        .into_iter()
+        .collect();
+    let data: Data = [(
+        Tag::OTHER_ALIGNMENTS,
+        Value::from("chr9,420,-,20S80M,60,0;chr9,800,+,30S70M,60,0;"),
+    )]
+    .into_iter()
+    .collect();
+
+    let record = RecordBuf::builder()
+        .set_name(read_name)
+        .set_flags(Flags::empty())
+        .set_reference_sequence_id(1)
+        .set_alignment_start(Position::try_from(120)?)
+        .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+        .set_cigar(cigar)
+        .set_sequence(Sequence::from(sequence.as_bytes()))
+        .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+        .set_data(data)
+        .build();
+
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+    writer.write_alignment_record(&header, &record)?;
+    writer.try_finish()?;
+
     let index = bam::fs::index(path)?;
     bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
 

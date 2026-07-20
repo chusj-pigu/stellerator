@@ -546,7 +546,7 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
     let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
         let record = result?;
-        for hit in classify_record(
+        let RecordHits { sequence, hits } = classify_record(
             &sample.header,
             &sample.name,
             span,
@@ -554,8 +554,18 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
             scan.require_partner_match,
             &record,
             scan.options,
-        ) {
-            write_hit(scan.tsv_writer, scan.fasta_writer, &hit)?;
+        );
+
+        for (index, hit) in hits.into_iter().enumerate() {
+            write_tsv_row(scan.tsv_writer, &hit)?;
+
+            // One FASTA record per read: a chimeric read supporting several
+            // junctions gets one row per junction in the TSV, but its sequence
+            // is written once. The header describes the first junction.
+            if index == 0 {
+                write_fasta_record(scan.fasta_writer, &hit.fasta_header, &sequence)?;
+            }
+
             if let Some(collector) = scan.junctions {
                 collector
                     .lock()
@@ -617,12 +627,15 @@ fn classify_record(
     require_partner_match: bool,
     record: &bam::Record,
     options: ScanOptions,
-) -> Vec<Hit> {
+) -> RecordHits {
     let Some(context) = read_context(header, record, options) else {
-        return Vec::new();
+        return RecordHits {
+            sequence: String::new(),
+            hits: Vec::new(),
+        };
     };
 
-    parse_sa_entries(&context.sa_tag)
+    let hits = parse_sa_entries(&context.sa_tag)
         .into_iter()
         .filter_map(|partner| {
             build_hit(
@@ -634,7 +647,12 @@ fn classify_record(
                 partner,
             )
         })
-        .collect()
+        .collect();
+
+    RecordHits {
+        sequence: context.sequence,
+        hits,
+    }
 }
 
 /// Compute the per-read context, or `None` if the record cannot support a fusion
@@ -810,7 +828,6 @@ fn build_hit(
             partner.strand,
             sample
         ),
-        fasta_sequence: context.sequence.clone(),
         junction,
     })
 }
@@ -1005,11 +1022,7 @@ fn write_tsv_header(writer: &Arc<Mutex<BufWriter<File>>>) -> Result<()> {
     Ok(())
 }
 
-fn write_hit(
-    tsv_writer: &Arc<Mutex<BufWriter<File>>>,
-    fasta_writer: &Arc<Mutex<FastaWriter>>,
-    hit: &Hit,
-) -> Result<()> {
+fn write_tsv_row(tsv_writer: &Arc<Mutex<BufWriter<File>>>, hit: &Hit) -> Result<()> {
     {
         let mut writer = tsv_writer
             .lock()
@@ -1045,18 +1058,38 @@ fn write_hit(
         )?;
     }
 
+    Ok(())
+}
+
+/// Write one FASTA record for a read. Called once per record even when the read
+/// supports several junctions, so the sequence is not duplicated.
+fn write_fasta_record(
+    fasta_writer: &Arc<Mutex<FastaWriter>>,
+    header: &str,
+    sequence: &str,
+) -> Result<()> {
     let mut writer = fasta_writer
         .lock()
         .map_err(|_| anyhow!("FASTA writer lock was poisoned"))?;
-    writer.write_record(&hit.fasta_header, &hit.fasta_sequence)?;
+    writer.write_record(header, sequence)?;
     Ok(())
 }
 
 struct Hit {
     tsv: TsvRecord,
     fasta_header: String,
-    fasta_sequence: String,
     junction: Junction,
+}
+
+/// Everything one alignment record contributes: a hit per supplementary
+/// alignment, plus the read sequence held once.
+///
+/// The sequence lives here rather than on each [`Hit`] because a chimeric long
+/// read can carry many `SA` entries, and copying a multi-kilobase sequence per
+/// junction is expensive in both memory and FASTA volume.
+struct RecordHits {
+    sequence: String,
+    hits: Vec<Hit>,
 }
 
 struct PartnerAlignment {

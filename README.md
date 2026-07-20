@@ -146,7 +146,9 @@ The TSV includes:
 
 ### FASTA
 
-The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
+The gzipped FASTA output contains the supporting read sequences, **one record per read**. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
+
+A chimeric read whose `SA` tag lists several supplementary alignments produces one TSV row per supplementary alignment but a single FASTA record, so a long read's sequence is never repeated; its header describes the first of those junctions.
 
 ### VCF
 
