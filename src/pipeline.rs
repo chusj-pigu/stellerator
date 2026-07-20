@@ -24,7 +24,7 @@ use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
     cli::Args,
     fasta::FastaWriter,
-    vcf::{Junction, cluster_consensus, write_vcf},
+    vcf::{Junction, StructuralVariant, cluster_consensus, write_vcf},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,24 +141,21 @@ pub fn run(args: Args) -> Result<()> {
             .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
         let mut variants = cluster_consensus(junctions, args.sv_slop);
 
-        // Depth is only knowable once the consensus breakpoint is fixed, so
-        // re-query each call. Call counts are small, which keeps this cheap and
-        // preserves the streaming scan above.
-        for variant in &mut variants {
-            for sample in &samples {
-                let mut names =
-                    spanning_read_names(sample, &variant.chrom1, variant.pos1, scan_options)?;
+        // Depth is only knowable once the consensus breakpoint is fixed, so it
+        // is measured here rather than during the streaming scan. Each sample
+        // opens its reader once and walks every breakpoint, and samples run in
+        // parallel.
+        let per_sample: Vec<(String, Vec<usize>)> = samples
+            .par_iter()
+            .map(|sample| {
+                let depths = sample_depths(sample, &variants, scan_options)?;
+                Ok((sample.name.clone(), depths))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-                // A supporting read spans the junction by definition, even when
-                // clipping leaves its alignment ending short of the consensus
-                // breakpoint. Without this, AD would not sum to DP.
-                if let Some(support) = variant.support_reads(&sample.name) {
-                    names.extend(support.iter().cloned());
-                }
-
-                variant
-                    .depth_by_sample
-                    .insert(sample.name.clone(), names.len());
+        for (sample_name, depths) in per_sample {
+            for (variant, depth) in variants.iter_mut().zip(depths) {
+                variant.depth_by_sample.insert(sample_name.clone(), depth);
             }
         }
 
@@ -182,53 +179,71 @@ pub fn run(args: Args) -> Result<()> {
 /// cannot distinguish a clonal event from a handful of artefacts. Reads are
 /// counted by name so a read with several alignments over the position counts
 /// once, and supplementary alignments are skipped for the same reason.
-fn spanning_read_names(
+fn sample_depths(
     sample: &BamSample,
-    reference_name: &str,
-    position: usize,
+    variants: &[StructuralVariant],
     options: ScanOptions,
-) -> Result<std::collections::BTreeSet<String>> {
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    // A contig absent from this sample's header contributes no depth.
-    let known = sample
-        .header
-        .reference_sequences()
-        .keys()
-        .any(|name| String::from_utf8_lossy(name.as_ref()) == reference_name);
-    if !known {
-        return Ok(names);
+) -> Result<Vec<usize>> {
+    if variants.is_empty() {
+        return Ok(Vec::new());
     }
 
+    // Opening an indexed reader parses the whole BAM index, so it is done once
+    // per sample and reused for every breakpoint rather than per call.
     let mut reader = bam::io::indexed_reader::Builder::default()
         .build_from_path(&sample.path)
         .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
 
-    let start = Position::try_from(position)
-        .map_err(|_| anyhow!("invalid breakpoint position {position}"))?;
-    let region = Region::new(reference_name.to_string(), start..=start);
+    let known_references: std::collections::HashSet<String> = sample
+        .header
+        .reference_sequences()
+        .keys()
+        .map(|name| String::from_utf8_lossy(name.as_ref()).into_owned())
+        .collect();
 
-    let query = reader.query(&sample.header, &region)?;
-    for result in query.records() {
-        let record = result?;
-        let flags = record.flags();
-        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
-            continue;
+    let mut depths = Vec::with_capacity(variants.len());
+
+    for variant in variants {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // A contig absent from this sample's header contributes no depth.
+        if known_references.contains(&variant.chrom1) {
+            let start = Position::try_from(variant.pos1)
+                .map_err(|_| anyhow!("invalid breakpoint position {}", variant.pos1))?;
+            let region = Region::new(variant.chrom1.clone(), start..=start);
+
+            let query = reader.query(&sample.header, &region)?;
+            for result in query.records() {
+                let record = result?;
+                let flags = record.flags();
+                if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+                    continue;
+                }
+                if flags.is_duplicate() && !options.include_duplicates {
+                    continue;
+                }
+                if options.min_mapq > 0
+                    && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+                {
+                    continue;
+                }
+                if let Some(name) = record.name() {
+                    names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
+                }
+            }
         }
-        if flags.is_duplicate() && !options.include_duplicates {
-            continue;
+
+        // A supporting read spans the junction by definition, even when
+        // clipping leaves its alignment ending short of the consensus
+        // breakpoint. Without this, AD would not sum to DP.
+        if let Some(support) = variant.support_reads(&sample.name) {
+            names.extend(support.iter().cloned());
         }
-        if options.min_mapq > 0
-            && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
-        {
-            continue;
-        }
-        if let Some(name) = record.name() {
-            names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
-        }
+
+        depths.push(names.len());
     }
 
-    Ok(names)
+    Ok(depths)
 }
 
 /// Deterministically ordered sample names for VCF genotype columns.
