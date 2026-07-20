@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -42,8 +42,58 @@ pub struct StructuralVariant {
     pub transcript1: String,
     pub transcript2: String,
     pub region: String,
+    /// Lowest and highest query breakpoint among the supporting reads, showing
+    /// how far the cluster actually scattered.
+    pub pos1_range: (usize, usize),
+    /// Lowest and highest partner breakpoint among the supporting reads.
+    pub pos2_range: (usize, usize),
     pub support_total: usize,
-    pub support_by_sample: BTreeMap<String, usize>,
+    /// Names of the reads supporting the junction, per sample. Kept rather than
+    /// a bare count so depth can treat them as spanning by definition.
+    pub support_reads_by_sample: BTreeMap<String, BTreeSet<String>>,
+    /// Reads spanning the consensus breakpoint per sample, filled in after
+    /// clustering by re-querying each BAM. Empty until then.
+    pub depth_by_sample: BTreeMap<String, usize>,
+}
+
+impl StructuralVariant {
+    /// Supporting reads for a sample (the ALT allele depth).
+    pub fn support(&self, sample: &str) -> usize {
+        self.support_reads_by_sample
+            .get(sample)
+            .map_or(0, |reads| reads.len())
+    }
+
+    /// Names of the reads supporting the junction in a sample.
+    pub fn support_reads(&self, sample: &str) -> Option<&BTreeSet<String>> {
+        self.support_reads_by_sample.get(sample)
+    }
+
+    /// Reads spanning the breakpoint in a sample (total depth).
+    pub fn depth(&self, sample: &str) -> usize {
+        self.depth_by_sample.get(sample).copied().unwrap_or(0)
+    }
+
+    /// Fraction of spanning reads that support the junction.
+    pub fn allele_fraction(&self, sample: &str) -> f64 {
+        let depth = self.depth(sample);
+        if depth == 0 {
+            return 0.0;
+        }
+        (self.support(sample) as f64 / depth as f64).min(1.0)
+    }
+
+    pub fn total_depth(&self) -> usize {
+        self.depth_by_sample.values().sum()
+    }
+
+    pub fn total_allele_fraction(&self) -> f64 {
+        let depth = self.total_depth();
+        if depth == 0 {
+            return 0.0;
+        }
+        (self.support_total as f64 / depth as f64).min(1.0)
+    }
 }
 
 /// Discrete key that breakends must share before position-tolerance clustering.
@@ -110,15 +160,19 @@ pub fn cluster_consensus(mut junctions: Vec<Junction>, slop: usize) -> Vec<Struc
 fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
     let anchor = &cluster[0];
 
-    let mut support_by_sample: BTreeMap<String, usize> = BTreeMap::new();
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    // Collect names rather than counts: a read seen twice in the same cluster
+    // still supports the junction once, and depth needs the names later.
+    let mut support_reads_by_sample: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for junction in cluster {
-        if seen.insert((junction.sample.as_str(), junction.read_name.as_str())) {
-            *support_by_sample
-                .entry(junction.sample.clone())
-                .or_insert(0) += 1;
-        }
+        support_reads_by_sample
+            .entry(junction.sample.clone())
+            .or_default()
+            .insert(junction.read_name.clone());
     }
+    let support_total = support_reads_by_sample
+        .values()
+        .map(|reads| reads.len())
+        .sum();
 
     StructuralVariant {
         chrom1: anchor.chrom1.clone(),
@@ -135,9 +189,29 @@ fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
         transcript1: anchor.query_transcript.clone(),
         transcript2: anchor.partner_transcript.clone(),
         region: format!("{}/{}", anchor.query_region, anchor.partner_region),
-        support_total: seen.len(),
-        support_by_sample,
+        pos1_range: position_range(cluster.iter().map(|junction| junction.pos1)),
+        pos2_range: position_range(cluster.iter().map(|junction| junction.pos2)),
+        support_total,
+        support_reads_by_sample,
+        depth_by_sample: BTreeMap::new(),
     }
+}
+
+/// Lowest and highest value in a cluster, used to expose breakpoint scatter.
+fn position_range(values: impl Iterator<Item = usize>) -> (usize, usize) {
+    let values: Vec<usize> = values.collect();
+    let low = values.iter().copied().min().unwrap_or(0);
+    let high = values.iter().copied().max().unwrap_or(0);
+    (low, high)
+}
+
+/// Offsets from an anchor position to the ends of a range, as VCF confidence
+/// intervals are expressed relative to the reported position.
+fn range_offsets(anchor: usize, range: (usize, usize)) -> (i64, i64) {
+    (
+        range.0 as i64 - anchor as i64,
+        range.1 as i64 - anchor as i64,
+    )
 }
 
 fn median(values: impl Iterator<Item = usize>) -> usize {
@@ -212,6 +286,38 @@ pub fn write_vcf(
     )?;
     writeln!(
         writer,
+        "##INFO=<ID=CIPOS,Number=2,Type=Integer,Description=\"Offsets from POS to the lowest and highest supporting breakpoint in the cluster; the width shows the observed breakpoint scatter\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=CIPOS2,Number=2,Type=Integer,Description=\"Offsets from POS2 to the lowest and highest supporting partner breakpoint in the cluster\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Reads spanning the breakend across all samples\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Fraction of spanning reads supporting the junction across all samples\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype; nominal only, low-frequency fusions are not diploid states - use AF and AD\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Reads spanning the breakend in the sample\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Spanning reads not supporting, and supporting, the junction\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=AF,Number=1,Type=Float,Description=\"Fraction of spanning reads supporting the junction in the sample\">"
+    )?;
+    writeln!(
+        writer,
         "##FORMAT=<ID=SR,Number=1,Type=Integer,Description=\"Supporting reads in the sample\">"
     )?;
     for (name, length) in contigs {
@@ -244,17 +350,34 @@ pub fn write_vcf(
             variant.region,
             variant.support_total,
         );
+        let (cipos_low, cipos_high) = range_offsets(variant.pos1, variant.pos1_range);
+        let (cipos2_low, cipos2_high) = range_offsets(variant.pos2, variant.pos2_range);
+        let info = format!(
+            "{info};CIPOS={cipos_low},{cipos_high};CIPOS2={cipos2_low},{cipos2_high};DP={};AF={:.6}",
+            variant.total_depth(),
+            variant.total_allele_fraction()
+        );
         write!(
             writer,
-            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tSR",
+            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tGT:DP:AD:AF:SR",
             variant.chrom1,
             variant.pos1,
             index + 1,
             info,
         )?;
         for sample in samples {
-            let support = variant.support_by_sample.get(sample).copied().unwrap_or(0);
-            write!(writer, "\t{support}")?;
+            let support = variant.support(sample);
+            let depth = variant.depth(sample);
+            // Depth is measured at the consensus breakpoint, which can sit a
+            // base or two off an individual read's end, so clamp rather than
+            // underflow.
+            let reference = depth.saturating_sub(support);
+            let genotype = if support > 0 { "0/1" } else { "0/0" };
+            write!(
+                writer,
+                "\t{genotype}:{depth}:{reference},{support}:{:.6}:{support}",
+                variant.allele_fraction(sample)
+            )?;
         }
         writeln!(writer)?;
     }
@@ -299,12 +422,19 @@ mod tests {
 
         let variant = &variants[0];
         assert_eq!(variant.support_total, 3);
-        assert_eq!(variant.support_by_sample.get("s1"), Some(&2));
-        assert_eq!(variant.support_by_sample.get("s2"), Some(&1));
+        assert_eq!(variant.support("s1"), 2);
+        assert_eq!(variant.support("s2"), 1);
         assert_eq!(variant.gene1, "BCR");
         assert_eq!(variant.gene2, "ABL1");
         assert_eq!(variant.pos1, 101);
         assert_eq!(variant.pos2, 401);
+
+        // The scatter of the member breakpoints is retained, so a generous
+        // --sv-slop reveals how wide real clusters are.
+        assert_eq!(variant.pos1_range, (100, 103));
+        assert_eq!(variant.pos2_range, (400, 402));
+        assert_eq!(range_offsets(variant.pos1, variant.pos1_range), (-1, 2));
+        assert_eq!(range_offsets(variant.pos2, variant.pos2_range), (-1, 1));
     }
 
     #[test]
@@ -329,7 +459,7 @@ mod tests {
         let variants = cluster_consensus(junctions, 10);
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].support_total, 1);
-        assert_eq!(variants[0].support_by_sample.get("s1"), Some(&1));
+        assert_eq!(variants[0].support("s1"), 1);
     }
 
     #[test]

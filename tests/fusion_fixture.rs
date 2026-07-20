@@ -208,8 +208,10 @@ fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
     assert!(cols[7].contains("GENE1=BCR"));
     assert!(cols[7].contains("GENE2=ABL1"));
     assert!(cols[7].contains("SR=1"));
-    assert_eq!(cols[8], "SR"); // FORMAT
-    assert_eq!(cols[9], "1"); // supporting reads for sample 'fusion'
+    assert!(cols[7].contains("DP=1"));
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR"); // FORMAT
+    // The lone spanning read is the supporting read, so AF is 1.
+    assert_eq!(cols[9], "0/1:1:0,1:1.000000:1");
 
     fs::remove_dir_all(fixture_dir)?;
     Ok(())
@@ -313,6 +315,218 @@ fn bare_output_vcf_flag_uses_derived_default_path() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[test]
+fn skips_duplicate_flagged_reads_unless_included() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("dups.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam_reads(
+        &bam_path,
+        &[
+            ("keep-read", Flags::empty(), 60),
+            ("dup-read", Flags::DUPLICATE, 60),
+        ],
+    )?;
+
+    // By default the duplicate-flagged read must not contribute support.
+    let default_tsv = fixture_dir.join("default.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &default_tsv,
+        &fixture_dir.join("default.fasta.gz"),
+        &[],
+    )?;
+    let tsv = fs::read_to_string(&default_tsv)?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(tsv.contains("keep-read"), "{tsv}");
+    assert!(!tsv.contains("dup-read"), "{tsv}");
+
+    // Opting in restores it.
+    let included_tsv = fixture_dir.join("included.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &included_tsv,
+        &fixture_dir.join("included.fasta.gz"),
+        &["--include-duplicates"],
+    )?;
+    let tsv = fs::read_to_string(&included_tsv)?;
+    assert_eq!(tsv.lines().count(), 3, "expected header + 2 rows\n{tsv}");
+    assert!(tsv.contains("keep-read"), "{tsv}");
+    assert!(tsv.contains("dup-read"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn min_mapq_defaults_to_taking_everything_and_warns() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("mapq.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam_reads(
+        &bam_path,
+        &[
+            ("high-mapq", Flags::empty(), 60),
+            ("low-mapq", Flags::empty(), 5),
+        ],
+    )?;
+
+    // Default takes everything, including the poorly mapped read.
+    let default_tsv = fixture_dir.join("default.tsv");
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&default_tsv)
+        .arg("--output-fasta")
+        .arg(fixture_dir.join("default.fasta.gz"))
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+    assert!(output.status.success());
+
+    let tsv = fs::read_to_string(&default_tsv)?;
+    assert_eq!(tsv.lines().count(), 3, "expected header + 2 rows\n{tsv}");
+    assert!(tsv.contains("high-mapq"), "{tsv}");
+    assert!(tsv.contains("low-mapq"), "{tsv}");
+
+    // ...and says so, so an unfiltered run is never silent.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--min-mapq is 0"),
+        "expected a warning about taking every alignment\n{stderr}"
+    );
+
+    // Raising the floor drops the low-quality alignment.
+    let filtered_tsv = fixture_dir.join("filtered.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &filtered_tsv,
+        &fixture_dir.join("filtered.fasta.gz"),
+        &["--min-mapq", "20"],
+    )?;
+    let tsv = fs::read_to_string(&filtered_tsv)?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(tsv.contains("high-mapq"), "{tsv}");
+    assert!(!tsv.contains("low-mapq"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn reports_low_allele_fraction_against_spanning_depth() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("lowfreq.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_vcf = fixture_dir.join("lowfreq.vcf");
+
+    write_annotation(&annotation_path)?;
+    // One supporting read against three non-supporting spanning reads.
+    write_indexed_bam_with_background(&bam_path, 3)?;
+
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("lowfreq.tsv"),
+        &fixture_dir.join("lowfreq.fasta.gz"),
+        &["--output-vcf", output_vcf.to_str().unwrap()],
+    )?;
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    let record = vcf
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .expect("a VCF record");
+    let cols: Vec<&str> = record.split('\t').collect();
+
+    // Only the split read supports the junction, but four reads span it.
+    assert!(cols[7].contains("SR=1"), "{record}");
+    assert!(cols[7].contains("DP=4"), "{record}");
+    assert!(cols[7].contains("AF=0.250000"), "{record}");
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR");
+    assert_eq!(cols[9], "0/1:4:3,1:0.250000:1", "{record}");
+
+    // The background reads must not be reported as candidates themselves.
+    let tsv = fs::read_to_string(fixture_dir.join("lowfreq.tsv"))?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(!tsv.contains("background-"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn scattered_cluster_reports_consistent_depth_and_scatter() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("scatter.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_vcf = fixture_dir.join("scatter.vcf");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_scattered_bam(&bam_path)?;
+
+    // A generous tolerance keeps the three reads in one cluster.
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("scatter.tsv"),
+        &fixture_dir.join("scatter.fasta.gz"),
+        &[
+            "--output-vcf",
+            output_vcf.to_str().unwrap(),
+            "--sv-slop",
+            "100",
+        ],
+    )?;
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    let records: Vec<&str> = vcf.lines().filter(|line| !line.starts_with('#')).collect();
+    assert_eq!(records.len(), 1, "expected a single merged call\n{vcf}");
+
+    let cols: Vec<&str> = records[0].split('\t').collect();
+    let info = cols[7];
+
+    // The observed scatter is reported, not hidden by the consensus position.
+    assert!(info.contains("CIPOS=-5,6"), "{info}");
+    assert!(info.contains("CIPOS2=-1,2"), "{info}");
+
+    // read-1 aligns 120-139 and so does not reach the consensus breakpoint at
+    // 144, but it supports the junction and must still count toward depth.
+    assert!(info.contains("SR=3"), "{info}");
+    assert!(info.contains("DP=3"), "{info}");
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR");
+    assert_eq!(cols[9], "0/1:3:0,3:1.000000:3", "{records:?}");
+
+    // AD must sum to DP.
+    let sample: Vec<&str> = cols[9].split(':').collect();
+    let depth: usize = sample[1].parse()?;
+    let allele_depths: Vec<usize> = sample[2]
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(
+        allele_depths.iter().sum::<usize>(),
+        depth,
+        "AD must sum to DP"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -332,12 +546,96 @@ chr9\tstellerator\texon\t400\t450\t.\t-\t.\tID=exon-ABL1-2;Parent=txABL1
 }
 
 fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    write_indexed_bam_reads(path, &[(read_name, Flags::empty(), 60)])
+}
+
+/// Write an indexed BAM containing one split-read record per entry, each with
+/// the given name and flags.
+fn write_indexed_bam_reads(
+    path: &Path,
+    reads: &[(&str, Flags, u8)],
+) -> Result<(), Box<dyn std::error::Error>> {
     let header: sam::Header = "\
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr9\tLN:1000
 @SQ\tSN:chr22\tLN:1000
 "
     .parse()?;
+
+    let sequence = "ACGT".repeat(25);
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+
+    for (read_name, flags, mapq) in reads {
+        let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+            .into_iter()
+            .collect();
+        let data: Data = [(
+            Tag::OTHER_ALIGNMENTS,
+            Value::from("chr9,420,-,20S80M,60,0;"),
+        )]
+        .into_iter()
+        .collect();
+
+        let record = RecordBuf::builder()
+            .set_name(*read_name)
+            .set_flags(*flags)
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(120)?)
+            .set_mapping_quality(MappingQuality::new(*mapq).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+            .set_data(data)
+            .build();
+
+        writer.write_alignment_record(&header, &record)?;
+    }
+
+    writer.try_finish()?;
+
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM with one split read plus `background` plain reads that
+/// span the same breakpoint without supporting any fusion, so the supporting
+/// read sits at a known low allele fraction.
+fn write_indexed_bam_with_background(
+    path: &Path,
+    background: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
+
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+
+    // Background first to keep the file coordinate sorted: 100M from 100 spans
+    // the breakpoint at 139 without carrying an SA tag.
+    let background_sequence = "ACGT".repeat(25);
+    for index in 0..background {
+        let cigar: Cigar = [Op::new(Kind::Match, 100)].into_iter().collect();
+        let record = RecordBuf::builder()
+            .set_name(format!("background-{index}"))
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(100)?)
+            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(background_sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; background_sequence.len()]))
+            .build();
+        writer.write_alignment_record(&header, &record)?;
+    }
 
     let sequence = "ACGT".repeat(25);
     let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
@@ -349,9 +647,8 @@ fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::er
     )]
     .into_iter()
     .collect();
-
     let record = RecordBuf::builder()
-        .set_name(read_name)
+        .set_name("fusion-read-1")
         .set_flags(Flags::empty())
         .set_reference_sequence_id(1)
         .set_alignment_start(Position::try_from(120)?)
@@ -361,15 +658,97 @@ fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::er
         .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
         .set_data(data)
         .build();
+    writer.write_alignment_record(&header, &record)?;
+
+    writer.try_finish()?;
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM where three reads support one junction but place it a
+/// few bases apart, as aligner wobble does. The earliest read's alignment ends
+/// before the consensus breakpoint, so it only counts toward depth if
+/// supporting reads are treated as spanning.
+fn write_indexed_scattered_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
 
     let file = File::create(path)?;
     let mut writer = bam::io::Writer::new(file);
     writer.write_header(&header)?;
-    writer.write_alignment_record(&header, &record)?;
-    writer.try_finish()?;
 
+    let sequence = "ACGT".repeat(25);
+    for (name, start, partner) in [
+        ("read-1", 120usize, "chr9,420,-,20S80M,60,0;"),
+        ("read-2", 125, "chr9,422,-,20S80M,60,0;"),
+        ("read-3", 131, "chr9,419,-,20S80M,60,0;"),
+    ] {
+        let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+            .into_iter()
+            .collect();
+        let data: Data = [(Tag::OTHER_ALIGNMENTS, Value::from(partner))]
+            .into_iter()
+            .collect();
+        let record = RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(start)?)
+            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+            .set_data(data)
+            .build();
+        writer.write_alignment_record(&header, &record)?;
+    }
+
+    writer.try_finish()?;
     let index = bam::fs::index(path)?;
     bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Run the CLI against a fixture, asserting it succeeded.
+fn run_extract(
+    bam: &Path,
+    annotation: &Path,
+    output_tsv: &Path,
+    output_fasta: &Path,
+    extra: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stellerator"));
+    command
+        .arg("--bam")
+        .arg(bam)
+        .arg("--annotation")
+        .arg(annotation)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(output_tsv)
+        .arg("--output-fasta")
+        .arg(output_fasta)
+        .arg("--threads")
+        .arg("1");
+    for arg in extra {
+        command.arg(arg);
+    }
+
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     Ok(())
 }

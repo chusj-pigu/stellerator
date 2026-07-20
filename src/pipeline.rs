@@ -18,7 +18,7 @@ use noodles_sam::{
 };
 use rayon::{ThreadPoolBuilder, prelude::*};
 use serde::Serialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
@@ -60,6 +60,14 @@ pub fn run(args: Args) -> Result<()> {
             .map_err(|error| anyhow!("failed to configure rayon thread pool: {error}"))?;
     }
 
+    if args.min_mapq == 0 {
+        warn!(
+            "--min-mapq is 0: taking every alignment regardless of mapping quality. \
+             Output may include low-quality and multi-mapping reads, which are a common \
+             source of spurious fusion candidates; raise --min-mapq to filter them."
+        );
+    }
+
     let samples = open_bam_samples(&args.bam)?;
     info!("processing {} BAM sample(s)", samples.len());
 
@@ -96,17 +104,18 @@ pub fn run(args: Args) -> Result<()> {
         .flat_map(|sample| query_spans.iter().map(move |span| (sample, span)))
         .collect();
 
-    work.par_iter().try_for_each(|&(sample, span)| {
-        process_span(
-            sample,
-            span,
-            partner_spans.as_deref(),
-            require_partner_match,
-            &tsv_writer,
-            &fasta_writer,
-            junctions.as_ref(),
-        )
-    })?;
+    let scan_options = ScanOptions::from_args(&args);
+    let scan = SpanScan {
+        partner_spans: partner_spans.as_deref(),
+        require_partner_match,
+        tsv_writer: &tsv_writer,
+        fasta_writer: &fasta_writer,
+        junctions: junctions.as_ref(),
+        options: scan_options,
+    };
+
+    work.par_iter()
+        .try_for_each(|&(sample, span)| process_span(sample, span, &scan))?;
 
     let fasta_writer = Arc::into_inner(fasta_writer)
         .ok_or_else(|| anyhow!("failed to reclaim FASTA writer"))?
@@ -130,7 +139,29 @@ pub fn run(args: Args) -> Result<()> {
         let junctions = junctions
             .into_inner()
             .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
-        let variants = cluster_consensus(junctions, args.sv_slop);
+        let mut variants = cluster_consensus(junctions, args.sv_slop);
+
+        // Depth is only knowable once the consensus breakpoint is fixed, so
+        // re-query each call. Call counts are small, which keeps this cheap and
+        // preserves the streaming scan above.
+        for variant in &mut variants {
+            for sample in &samples {
+                let mut names =
+                    spanning_read_names(sample, &variant.chrom1, variant.pos1, scan_options)?;
+
+                // A supporting read spans the junction by definition, even when
+                // clipping leaves its alignment ending short of the consensus
+                // breakpoint. Without this, AD would not sum to DP.
+                if let Some(support) = variant.support_reads(&sample.name) {
+                    names.extend(support.iter().cloned());
+                }
+
+                variant
+                    .depth_by_sample
+                    .insert(sample.name.clone(), names.len());
+            }
+        }
+
         let sample_names = sample_names(&samples);
         let contigs = union_contigs(&samples);
         write_vcf(vcf_path, &variants, &sample_names, &contigs)?;
@@ -142,6 +173,62 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Count reads spanning a breakpoint in one sample, applying the same record
+/// filters as the main scan.
+///
+/// This is the denominator behind allele fraction: without it a support count
+/// cannot distinguish a clonal event from a handful of artefacts. Reads are
+/// counted by name so a read with several alignments over the position counts
+/// once, and supplementary alignments are skipped for the same reason.
+fn spanning_read_names(
+    sample: &BamSample,
+    reference_name: &str,
+    position: usize,
+    options: ScanOptions,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // A contig absent from this sample's header contributes no depth.
+    let known = sample
+        .header
+        .reference_sequences()
+        .keys()
+        .any(|name| String::from_utf8_lossy(name.as_ref()) == reference_name);
+    if !known {
+        return Ok(names);
+    }
+
+    let mut reader = bam::io::indexed_reader::Builder::default()
+        .build_from_path(&sample.path)
+        .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
+
+    let start = Position::try_from(position)
+        .map_err(|_| anyhow!("invalid breakpoint position {position}"))?;
+    let region = Region::new(reference_name.to_string(), start..=start);
+
+    let query = reader.query(&sample.header, &region)?;
+    for result in query.records() {
+        let record = result?;
+        let flags = record.flags();
+        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+            continue;
+        }
+        if flags.is_duplicate() && !options.include_duplicates {
+            continue;
+        }
+        if options.min_mapq > 0
+            && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+        {
+            continue;
+        }
+        if let Some(name) = record.name() {
+            names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
+        }
+    }
+
+    Ok(names)
 }
 
 /// Deterministically ordered sample names for VCF genotype columns.
@@ -415,15 +502,18 @@ fn has_associated_index(bam_path: &Path) -> bool {
     bam_bai.exists() || bam_csi.exists()
 }
 
-fn process_span(
-    sample: &BamSample,
-    span: &GeneSpan,
-    partner_spans: Option<&[GeneSpan]>,
+/// Shared, read-only state for scanning gene spans: where results go and how
+/// records are filtered. Held once per run and borrowed by every worker.
+struct SpanScan<'a> {
+    partner_spans: Option<&'a [GeneSpan]>,
     require_partner_match: bool,
-    tsv_writer: &Arc<Mutex<BufWriter<File>>>,
-    fasta_writer: &Arc<Mutex<FastaWriter>>,
-    junctions: Option<&Mutex<Vec<Junction>>>,
-) -> Result<()> {
+    tsv_writer: &'a Arc<Mutex<BufWriter<File>>>,
+    fasta_writer: &'a Arc<Mutex<FastaWriter>>,
+    junctions: Option<&'a Mutex<Vec<Junction>>>,
+    options: ScanOptions,
+}
+
+fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Result<()> {
     debug!(
         sample = sample.name,
         gene = span.gene,
@@ -445,12 +535,13 @@ fn process_span(
             &sample.header,
             &sample.name,
             span,
-            partner_spans,
-            require_partner_match,
+            scan.partner_spans,
+            scan.require_partner_match,
             &record,
+            scan.options,
         ) {
-            write_hit(tsv_writer, fasta_writer, &hit)?;
-            if let Some(collector) = junctions {
+            write_hit(scan.tsv_writer, scan.fasta_writer, &hit)?;
+            if let Some(collector) = scan.junctions {
                 collector
                     .lock()
                     .map_err(|_| anyhow!("junction collector lock was poisoned"))?
@@ -487,6 +578,22 @@ struct ReadContext {
     sa_tag: String,
 }
 
+/// Read-filtering options applied to every scanned record.
+#[derive(Debug, Clone, Copy)]
+struct ScanOptions {
+    include_duplicates: bool,
+    min_mapq: u8,
+}
+
+impl ScanOptions {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            include_duplicates: args.include_duplicates,
+            min_mapq: args.min_mapq,
+        }
+    }
+}
+
 fn classify_record(
     header: &sam::Header,
     sample: &str,
@@ -494,8 +601,9 @@ fn classify_record(
     partner_spans: Option<&[GeneSpan]>,
     require_partner_match: bool,
     record: &bam::Record,
+    options: ScanOptions,
 ) -> Vec<Hit> {
-    let Some(context) = read_context(header, record) else {
+    let Some(context) = read_context(header, record, options) else {
         return Vec::new();
     };
 
@@ -515,10 +623,29 @@ fn classify_record(
 }
 
 /// Compute the per-read context, or `None` if the record cannot support a fusion
-/// call (unmapped, secondary, missing `SA` tag, or no sequence).
-fn read_context(header: &sam::Header, record: &bam::Record) -> Option<ReadContext> {
+/// call (unmapped, secondary, duplicate, missing `SA` tag, or no sequence).
+fn read_context(
+    header: &sam::Header,
+    record: &bam::Record,
+    options: ScanOptions,
+) -> Option<ReadContext> {
     let flags = record.flags();
     if flags.is_unmapped() || flags.is_secondary() {
+        return None;
+    }
+
+    // PCR/optical duplicates inflate apparent support, so drop them unless the
+    // caller opts in.
+    if flags.is_duplicate() && !options.include_duplicates {
+        return None;
+    }
+
+    // A floor of 0 takes everything. Above that, drop alignments below the
+    // threshold, including records with no reported MAPQ since their quality
+    // cannot be verified.
+    if options.min_mapq > 0
+        && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+    {
         return None;
     }
 
@@ -1187,6 +1314,8 @@ mod tests {
             output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
+            include_duplicates: false,
+            min_mapq: 0,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1256,6 +1385,8 @@ mod tests {
             output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
+            include_duplicates: false,
+            min_mapq: 0,
             threads: 1,
             verbose: false,
             log_file: None,
