@@ -567,6 +567,67 @@ fn writes_one_fasta_record_per_read_across_multiple_sa_entries()
     Ok(())
 }
 
+#[test]
+fn min_depth_drops_thinly_covered_calls() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("lowdepth.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    // One supporting read plus three spanning reads gives the call DP=4.
+    write_indexed_bam_with_background(&bam_path, 3)?;
+
+    let record_count =
+        |vcf: &str| -> usize { vcf.lines().filter(|line| !line.starts_with('#')).count() };
+
+    // At the depth of the call, it survives.
+    let kept_vcf = fixture_dir.join("kept.vcf");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("kept.tsv"),
+        &fixture_dir.join("kept.fasta.gz"),
+        &[
+            "--output-vcf",
+            kept_vcf.to_str().unwrap(),
+            "--min-depth",
+            "4",
+        ],
+    )?;
+    let vcf = fs::read_to_string(&kept_vcf)?;
+    assert_eq!(record_count(&vcf), 1, "expected the call to survive\n{vcf}");
+
+    // One above it, the call is dropped but the VCF is still well formed.
+    let dropped_vcf = fixture_dir.join("dropped.vcf");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("dropped.tsv"),
+        &fixture_dir.join("dropped.fasta.gz"),
+        &[
+            "--output-vcf",
+            dropped_vcf.to_str().unwrap(),
+            "--min-depth",
+            "5",
+        ],
+    )?;
+    let vcf = fs::read_to_string(&dropped_vcf)?;
+    assert_eq!(
+        record_count(&vcf),
+        0,
+        "expected the call to be dropped\n{vcf}"
+    );
+    assert!(vcf.contains("##fileformat=VCFv4.2"), "{vcf}");
+    assert!(vcf.contains("#CHROM"), "{vcf}");
+
+    // Filtering the VCF must not touch the per-read candidate outputs.
+    let tsv = fs::read_to_string(fixture_dir.join("dropped.tsv"))?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,

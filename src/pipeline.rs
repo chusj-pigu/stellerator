@@ -68,6 +68,12 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
+    // Depth only exists for consensus calls, so the filter is a silent no-op
+    // without a VCF to filter.
+    if args.min_depth > 0 && args.output_vcf.is_none() {
+        warn!("--min-depth only filters the consensus VCF and has no effect without --output-vcf");
+    }
+
     let samples = open_bam_samples(&args.bam)?;
     info!("processing {} BAM sample(s)", samples.len());
 
@@ -156,6 +162,27 @@ pub fn run(args: Args) -> Result<()> {
         for (sample_name, depths) in per_sample {
             for (variant, depth) in variants.iter_mut().zip(depths) {
                 variant.depth_by_sample.insert(sample_name.clone(), depth);
+            }
+        }
+
+        // Drop calls whose breakpoint is too thinly covered to interpret: an
+        // allele fraction over a denominator of one or two reads says little.
+        // A call survives if any single sample is deep enough, so one shallow
+        // sample cannot sink a cohort-wide call.
+        if args.min_depth > 0 {
+            let before = variants.len();
+            variants.retain(|variant| {
+                samples
+                    .iter()
+                    .any(|sample| variant.depth(&sample.name) >= args.min_depth)
+            });
+
+            let dropped = before - variants.len();
+            if dropped > 0 {
+                info!(
+                    "dropped {dropped} consensus call(s) below --min-depth {}",
+                    args.min_depth
+                );
             }
         }
 
@@ -1364,6 +1391,7 @@ mod tests {
             sv_slop: 10,
             include_duplicates: false,
             min_mapq: 0,
+            min_depth: 0,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1435,6 +1463,7 @@ mod tests {
             sv_slop: 10,
             include_duplicates: false,
             min_mapq: 0,
+            min_depth: 0,
             threads: 1,
             verbose: false,
             log_file: None,

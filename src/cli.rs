@@ -62,6 +62,13 @@ pub struct Args {
         help = "Minimum mapping quality for a read to be considered; 0 (the default) takes every alignment"
     )]
     pub min_mapq: u8,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help = "Drop consensus VCF calls whose breakpoint has fewer than N spanning reads; 0 (the default) keeps every call"
+    )]
+    pub min_depth: usize,
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub threads: usize,
     #[arg(long, action = ArgAction::SetTrue)]
