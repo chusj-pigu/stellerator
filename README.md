@@ -198,11 +198,14 @@ That gives, per sample, `DP` (spanning reads), `AD` (non-supporting,supporting)
 and `AF` (supporting / spanning). A junction backed by one read out of four
 spanning reads is reported as `0/1:4:3,1:0.250000:1`.
 
+Supporting reads always count toward `DP`, even when clipping leaves their
+alignment ending short of the consensus breakpoint, so `AD` always sums to `DP`.
+Non-supporting reads are counted only if they actually span the position, so
+`DP` can still understate coverage slightly when a cluster is widely scattered.
+
 `GT` is nominal. Low-frequency somatic fusions are not diploid genotypes, so it
 is emitted as `0/1` whenever there is any support and `0/0` otherwise; treat
-`AF` and `AD` as the real signal. Note also that `DP` is measured at the
-consensus breakpoint, which can sit a base or two away from an individual read's
-clipped end.
+`AF` and `AD` as the real signal.
 
 ## Development
 

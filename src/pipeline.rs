@@ -146,9 +146,19 @@ pub fn run(args: Args) -> Result<()> {
         // preserves the streaming scan above.
         for variant in &mut variants {
             for sample in &samples {
-                let depth =
-                    spanning_read_count(sample, &variant.chrom1, variant.pos1, scan_options)?;
-                variant.depth_by_sample.insert(sample.name.clone(), depth);
+                let mut names =
+                    spanning_read_names(sample, &variant.chrom1, variant.pos1, scan_options)?;
+
+                // A supporting read spans the junction by definition, even when
+                // clipping leaves its alignment ending short of the consensus
+                // breakpoint. Without this, AD would not sum to DP.
+                if let Some(support) = variant.support_reads(&sample.name) {
+                    names.extend(support.iter().cloned());
+                }
+
+                variant
+                    .depth_by_sample
+                    .insert(sample.name.clone(), names.len());
             }
         }
 
@@ -172,12 +182,14 @@ pub fn run(args: Args) -> Result<()> {
 /// cannot distinguish a clonal event from a handful of artefacts. Reads are
 /// counted by name so a read with several alignments over the position counts
 /// once, and supplementary alignments are skipped for the same reason.
-fn spanning_read_count(
+fn spanning_read_names(
     sample: &BamSample,
     reference_name: &str,
     position: usize,
     options: ScanOptions,
-) -> Result<usize> {
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
     // A contig absent from this sample's header contributes no depth.
     let known = sample
         .header
@@ -185,7 +197,7 @@ fn spanning_read_count(
         .keys()
         .any(|name| String::from_utf8_lossy(name.as_ref()) == reference_name);
     if !known {
-        return Ok(0);
+        return Ok(names);
     }
 
     let mut reader = bam::io::indexed_reader::Builder::default()
@@ -196,7 +208,6 @@ fn spanning_read_count(
         .map_err(|_| anyhow!("invalid breakpoint position {position}"))?;
     let region = Region::new(reference_name.to_string(), start..=start);
 
-    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
         let record = result?;
@@ -217,7 +228,7 @@ fn spanning_read_count(
         }
     }
 
-    Ok(names.len())
+    Ok(names)
 }
 
 /// Deterministically ordered sample names for VCF genotype columns.

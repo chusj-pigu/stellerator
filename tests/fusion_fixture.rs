@@ -467,6 +467,66 @@ fn reports_low_allele_fraction_against_spanning_depth() -> Result<(), Box<dyn st
     Ok(())
 }
 
+#[test]
+fn scattered_cluster_reports_consistent_depth_and_scatter() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("scatter.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_vcf = fixture_dir.join("scatter.vcf");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_scattered_bam(&bam_path)?;
+
+    // A generous tolerance keeps the three reads in one cluster.
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("scatter.tsv"),
+        &fixture_dir.join("scatter.fasta.gz"),
+        &[
+            "--output-vcf",
+            output_vcf.to_str().unwrap(),
+            "--sv-slop",
+            "100",
+        ],
+    )?;
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    let records: Vec<&str> = vcf.lines().filter(|line| !line.starts_with('#')).collect();
+    assert_eq!(records.len(), 1, "expected a single merged call\n{vcf}");
+
+    let cols: Vec<&str> = records[0].split('\t').collect();
+    let info = cols[7];
+
+    // The observed scatter is reported, not hidden by the consensus position.
+    assert!(info.contains("CIPOS=-5,6"), "{info}");
+    assert!(info.contains("CIPOS2=-1,2"), "{info}");
+
+    // read-1 aligns 120-139 and so does not reach the consensus breakpoint at
+    // 144, but it supports the junction and must still count toward depth.
+    assert!(info.contains("SR=3"), "{info}");
+    assert!(info.contains("DP=3"), "{info}");
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR");
+    assert_eq!(cols[9], "0/1:3:0,3:1.000000:3", "{records:?}");
+
+    // AD must sum to DP.
+    let sample: Vec<&str> = cols[9].split(':').collect();
+    let depth: usize = sample[1].parse()?;
+    let allele_depths: Vec<usize> = sample[2]
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(
+        allele_depths.iter().sum::<usize>(),
+        depth,
+        "AD must sum to DP"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -599,6 +659,55 @@ fn write_indexed_bam_with_background(
         .set_data(data)
         .build();
     writer.write_alignment_record(&header, &record)?;
+
+    writer.try_finish()?;
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM where three reads support one junction but place it a
+/// few bases apart, as aligner wobble does. The earliest read's alignment ends
+/// before the consensus breakpoint, so it only counts toward depth if
+/// supporting reads are treated as spanning.
+fn write_indexed_scattered_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
+
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+
+    let sequence = "ACGT".repeat(25);
+    for (name, start, partner) in [
+        ("read-1", 120usize, "chr9,420,-,20S80M,60,0;"),
+        ("read-2", 125, "chr9,422,-,20S80M,60,0;"),
+        ("read-3", 131, "chr9,419,-,20S80M,60,0;"),
+    ] {
+        let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+            .into_iter()
+            .collect();
+        let data: Data = [(Tag::OTHER_ALIGNMENTS, Value::from(partner))]
+            .into_iter()
+            .collect();
+        let record = RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(start)?)
+            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+            .set_data(data)
+            .build();
+        writer.write_alignment_record(&header, &record)?;
+    }
 
     writer.try_finish()?;
     let index = bam::fs::index(path)?;

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -48,7 +48,9 @@ pub struct StructuralVariant {
     /// Lowest and highest partner breakpoint among the supporting reads.
     pub pos2_range: (usize, usize),
     pub support_total: usize,
-    pub support_by_sample: BTreeMap<String, usize>,
+    /// Names of the reads supporting the junction, per sample. Kept rather than
+    /// a bare count so depth can treat them as spanning by definition.
+    pub support_reads_by_sample: BTreeMap<String, BTreeSet<String>>,
     /// Reads spanning the consensus breakpoint per sample, filled in after
     /// clustering by re-querying each BAM. Empty until then.
     pub depth_by_sample: BTreeMap<String, usize>,
@@ -57,7 +59,14 @@ pub struct StructuralVariant {
 impl StructuralVariant {
     /// Supporting reads for a sample (the ALT allele depth).
     pub fn support(&self, sample: &str) -> usize {
-        self.support_by_sample.get(sample).copied().unwrap_or(0)
+        self.support_reads_by_sample
+            .get(sample)
+            .map_or(0, |reads| reads.len())
+    }
+
+    /// Names of the reads supporting the junction in a sample.
+    pub fn support_reads(&self, sample: &str) -> Option<&BTreeSet<String>> {
+        self.support_reads_by_sample.get(sample)
     }
 
     /// Reads spanning the breakpoint in a sample (total depth).
@@ -151,15 +160,19 @@ pub fn cluster_consensus(mut junctions: Vec<Junction>, slop: usize) -> Vec<Struc
 fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
     let anchor = &cluster[0];
 
-    let mut support_by_sample: BTreeMap<String, usize> = BTreeMap::new();
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    // Collect names rather than counts: a read seen twice in the same cluster
+    // still supports the junction once, and depth needs the names later.
+    let mut support_reads_by_sample: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for junction in cluster {
-        if seen.insert((junction.sample.as_str(), junction.read_name.as_str())) {
-            *support_by_sample
-                .entry(junction.sample.clone())
-                .or_insert(0) += 1;
-        }
+        support_reads_by_sample
+            .entry(junction.sample.clone())
+            .or_default()
+            .insert(junction.read_name.clone());
     }
+    let support_total = support_reads_by_sample
+        .values()
+        .map(|reads| reads.len())
+        .sum();
 
     StructuralVariant {
         chrom1: anchor.chrom1.clone(),
@@ -178,8 +191,8 @@ fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
         region: format!("{}/{}", anchor.query_region, anchor.partner_region),
         pos1_range: position_range(cluster.iter().map(|junction| junction.pos1)),
         pos2_range: position_range(cluster.iter().map(|junction| junction.pos2)),
-        support_total: seen.len(),
-        support_by_sample,
+        support_total,
+        support_reads_by_sample,
         depth_by_sample: BTreeMap::new(),
     }
 }
@@ -409,8 +422,8 @@ mod tests {
 
         let variant = &variants[0];
         assert_eq!(variant.support_total, 3);
-        assert_eq!(variant.support_by_sample.get("s1"), Some(&2));
-        assert_eq!(variant.support_by_sample.get("s2"), Some(&1));
+        assert_eq!(variant.support("s1"), 2);
+        assert_eq!(variant.support("s2"), 1);
         assert_eq!(variant.gene1, "BCR");
         assert_eq!(variant.gene2, "ABL1");
         assert_eq!(variant.pos1, 101);
@@ -446,7 +459,7 @@ mod tests {
         let variants = cluster_consensus(junctions, 10);
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].support_total, 1);
-        assert_eq!(variants[0].support_by_sample.get("s1"), Some(&1));
+        assert_eq!(variants[0].support("s1"), 1);
     }
 
     #[test]
