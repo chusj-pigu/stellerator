@@ -75,10 +75,17 @@ pub fn run(args: Args) -> Result<()> {
     let require_partner_match = args.partner_gene.is_some();
     info!("loaded {} query intervals", query_spans.len());
 
-    let tsv_writer = Arc::new(Mutex::new(create_tsv_writer(&args.output_tsv)?));
-    let fasta_writer = Arc::new(Mutex::new(FastaWriter::create(&args.output_fasta)?));
-    let junctions = args
+    let output_tsv = resolve_output_path(args.output_tsv.as_deref(), &samples, &args, "tsv");
+    let output_fasta =
+        resolve_output_path(args.output_fasta.as_deref(), &samples, &args, "fasta.gz");
+    let output_vcf = args
         .output_vcf
+        .as_ref()
+        .map(|explicit| resolve_output_path(explicit.as_deref(), &samples, &args, "vcf"));
+
+    let tsv_writer = Arc::new(Mutex::new(create_tsv_writer(&output_tsv)?));
+    let fasta_writer = Arc::new(Mutex::new(FastaWriter::create(&output_fasta)?));
+    let junctions = output_vcf
         .as_ref()
         .map(|_| Mutex::new(Vec::<Junction>::new()));
 
@@ -115,11 +122,11 @@ pub fn run(args: Args) -> Result<()> {
 
     info!(
         "finished writing {} and {}",
-        args.output_tsv.display(),
-        args.output_fasta.display()
+        output_tsv.display(),
+        output_fasta.display()
     );
 
-    if let (Some(vcf_path), Some(junctions)) = (args.output_vcf.as_ref(), junctions) {
+    if let (Some(vcf_path), Some(junctions)) = (output_vcf.as_ref(), junctions) {
         let junctions = junctions
             .into_inner()
             .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
@@ -160,6 +167,95 @@ fn union_contigs(samples: &[BamSample]) -> Vec<(String, Option<usize>)> {
     }
 
     contigs
+}
+
+/// Resolve an output path: use `explicit` when provided, otherwise build a
+/// default from the BAM basename and requested genes (e.g. `sample.BCR_ABL1.tsv`).
+fn resolve_output_path(
+    explicit: Option<&Path>,
+    samples: &[BamSample],
+    args: &Args,
+    extension: &str,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+
+    let paths: Vec<PathBuf> = samples.iter().map(|sample| sample.path.clone()).collect();
+    let names: Vec<String> = samples.iter().map(|sample| sample.name.clone()).collect();
+    let bam_token = bam_basename_token(&paths, &names);
+    let genes_token = genes_basename_token(&args.genes, args.partner_gene.as_deref());
+    default_output_path(&bam_token, &genes_token, extension)
+}
+
+fn default_output_path(bam_token: &str, genes_token: &str, extension: &str) -> PathBuf {
+    PathBuf::from(format!("{bam_token}.{genes_token}.{extension}"))
+}
+
+/// Representative BAM basename for default output names: the sample stem for a
+/// single BAM, the shared parent directory name for several BAMs in one place,
+/// otherwise the first sample's name.
+fn bam_basename_token(paths: &[PathBuf], names: &[String]) -> String {
+    if names.len() == 1 {
+        return sanitize_token(&names[0]);
+    }
+
+    if let Some(parent) = paths.first().and_then(|path| path.parent())
+        && !parent.as_os_str().is_empty()
+        && paths.iter().all(|path| path.parent() == Some(parent))
+        && let Some(name) = parent.file_name().and_then(|name| name.to_str())
+        && !name.is_empty()
+    {
+        return sanitize_token(name);
+    }
+
+    names
+        .first()
+        .map(|name| sanitize_token(name))
+        .unwrap_or_else(|| "stellerator".to_string())
+}
+
+/// Join the requested genes (and partner gene, if distinct) into a filename
+/// token, e.g. `BCR_ABL1`.
+fn genes_basename_token(genes: &[String], partner_gene: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for gene in genes {
+        push_unique_token(&mut parts, gene);
+    }
+    if let Some(partner) = partner_gene {
+        push_unique_token(&mut parts, partner);
+    }
+
+    if parts.is_empty() {
+        "genes".to_string()
+    } else {
+        parts.join("_")
+    }
+}
+
+fn push_unique_token(parts: &mut Vec<String>, value: &str) {
+    let token = sanitize_token(value);
+    if !token.is_empty()
+        && !parts
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&token))
+    {
+        parts.push(token);
+    }
+}
+
+/// Replace filename-hostile characters so derived output paths stay valid.
+fn sanitize_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn validate_inputs(args: &Args) -> Result<()> {
@@ -831,9 +927,10 @@ struct PartnerAlignment {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_unique_sample_names, estimate_sa_breakpoint_position, filter_spans_by_gene_names,
-        find_overlapping_span, has_bam_extension, parse_sa_entries, partner_spans,
-        resolve_bam_inputs, sample_name,
+        bam_basename_token, check_unique_sample_names, default_output_path,
+        estimate_sa_breakpoint_position, filter_spans_by_gene_names, find_overlapping_span,
+        genes_basename_token, has_bam_extension, parse_sa_entries, partner_spans,
+        resolve_bam_inputs, sample_name, sanitize_token,
     };
     use crate::annotation::{Exon, GeneSpan, Transcript};
     use crate::cli::Args;
@@ -920,6 +1017,77 @@ mod tests {
         let error = resolve_bam_inputs(std::slice::from_ref(&dir)).unwrap_err();
         assert!(error.to_string().contains("no .bam files found"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn genes_token_joins_genes_and_appends_distinct_partner() {
+        assert_eq!(genes_basename_token(&["BCR".to_string()], None), "BCR");
+        assert_eq!(
+            genes_basename_token(&["BCR".to_string(), "ABL1".to_string()], None),
+            "BCR_ABL1"
+        );
+        assert_eq!(
+            genes_basename_token(&["BCR".to_string()], Some("ABL1")),
+            "BCR_ABL1"
+        );
+        // A partner already present as a query gene is not repeated.
+        assert_eq!(
+            genes_basename_token(&["BCR".to_string(), "ABL1".to_string()], Some("abl1")),
+            "BCR_ABL1"
+        );
+    }
+
+    #[test]
+    fn bam_token_uses_stem_then_shared_parent_directory() {
+        // A single BAM contributes its own stem.
+        assert_eq!(
+            bam_basename_token(
+                &[PathBuf::from("/data/sampleA.bam")],
+                &["sampleA".to_string()]
+            ),
+            "sampleA"
+        );
+
+        // Several BAMs in one directory collapse to that directory name.
+        assert_eq!(
+            bam_basename_token(
+                &[
+                    PathBuf::from("/data/cohort/a.bam"),
+                    PathBuf::from("/data/cohort/b.bam"),
+                ],
+                &["a".to_string(), "b".to_string()]
+            ),
+            "cohort"
+        );
+
+        // With no shared parent, fall back to the first sample name.
+        assert_eq!(
+            bam_basename_token(
+                &[PathBuf::from("/x/a.bam"), PathBuf::from("/y/b.bam")],
+                &["a".to_string(), "b".to_string()]
+            ),
+            "a"
+        );
+    }
+
+    #[test]
+    fn default_output_path_combines_bam_and_gene_tokens() {
+        assert_eq!(
+            default_output_path("sampleA", "BCR_ABL1", "tsv"),
+            PathBuf::from("sampleA.BCR_ABL1.tsv")
+        );
+        assert_eq!(
+            default_output_path("cohort", "BCR", "fasta.gz"),
+            PathBuf::from("cohort.BCR.fasta.gz")
+        );
+    }
+
+    #[test]
+    fn sanitize_token_replaces_path_hostile_characters() {
+        assert_eq!(sanitize_token("BCR/ABL1"), "BCR_ABL1");
+        assert_eq!(sanitize_token("gene with space"), "gene_with_space");
+        // Hyphens and dots are already filename-safe and are preserved.
+        assert_eq!(sanitize_token("HLA-DRB1.v2"), "HLA-DRB1.v2");
     }
 
     #[test]
@@ -1015,8 +1183,8 @@ mod tests {
             annotation: PathBuf::from("genes.gtf"),
             genes: vec!["BCR".to_string()],
             partner_gene: None,
-            output_tsv: PathBuf::from("out.tsv"),
-            output_fasta: PathBuf::from("out.fa.gz"),
+            output_tsv: None,
+            output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
             threads: 1,
@@ -1084,8 +1252,8 @@ mod tests {
             annotation: PathBuf::from("genes.gtf"),
             genes: vec!["BCR".to_string()],
             partner_gene: Some("ABL1".to_string()),
-            output_tsv: PathBuf::from("out.tsv"),
-            output_fasta: PathBuf::from("out.fa.gz"),
+            output_tsv: None,
+            output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
             threads: 1,

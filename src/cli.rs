@@ -23,16 +23,25 @@ pub struct Args {
     pub genes: Vec<String>,
     #[arg(long, value_name = "GENE")]
     pub partner_gene: Option<String>,
-    #[arg(long, value_name = "TSV", default_value = "stellerator.tsv")]
-    pub output_tsv: PathBuf,
-    #[arg(long, value_name = "FASTA_GZ", default_value = "stellerator.fasta.gz")]
-    pub output_fasta: PathBuf,
+    #[arg(
+        long,
+        value_name = "TSV",
+        help = "TSV output path (default: <bam-basename>.<genes>.tsv)"
+    )]
+    pub output_tsv: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "FASTA_GZ",
+        help = "Gzipped FASTA output path (default: <bam-basename>.<genes>.fasta.gz)"
+    )]
+    pub output_fasta: Option<PathBuf>,
     #[arg(
         long,
         value_name = "VCF",
-        help = "Optional VCF output of consensus structural variants clustered from supporting reads"
+        num_args = 0..=1,
+        help = "VCF output of consensus structural variants. Pass a path, or give the flag alone for <bam-basename>.<genes>.vcf; omit to skip the VCF."
     )]
-    pub output_vcf: Option<PathBuf>,
+    pub output_vcf: Option<Option<PathBuf>>,
     #[arg(
         long,
         value_name = "BP",

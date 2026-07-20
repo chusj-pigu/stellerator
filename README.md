@@ -89,13 +89,34 @@ cargo run -- \
 - `--annotation`: input GFF3 or GTF file
 - `--gene`: target gene to query; repeat for multiple genes
 - `--partner-gene`: optional partner gene constraint
-- `--output-tsv`: TSV output path
-- `--output-fasta`: gzipped FASTA output path
-- `--output-vcf`: optional VCF output of consensus structural variants (omit to skip VCF)
+- `--output-tsv`: TSV output path (default: `<bam-basename>.<genes>.tsv`)
+- `--output-fasta`: gzipped FASTA output path (default: `<bam-basename>.<genes>.fasta.gz`)
+- `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use `<bam-basename>.<genes>.vcf`; omit the flag entirely to skip the VCF
 - `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
 - `--threads`: rayon worker count
 - `--verbose`: enable debug logging
 - `--log-file`: optional log file path
+
+### Default output names
+
+When an output path is omitted, Stellerator builds one from the input BAM and
+the requested genes, so parallel runs over different genes or samples do not
+overwrite each other:
+
+```
+<bam-basename>.<genes>.<ext>
+```
+
+- `<bam-basename>` is the BAM file stem for a single input (`cohort/lib1.bam` gives
+  `lib1`). For several BAMs it is their shared parent directory name (`--bam cohort/`
+  or `--bam cohort/*.bam` gives `cohort`), falling back to the first sample name
+  when the inputs have no common parent.
+- `<genes>` joins the requested `--gene` values with `_`, appending `--partner-gene`
+  when it is not already among them.
+
+So `--bam sampleA.bam --gene BCR --partner-gene ABL1` writes
+`sampleA.BCR_ABL1.tsv` and `sampleA.BCR_ABL1.fasta.gz`. Characters that are
+awkward in filenames are replaced with `_`.
 
 ## Output
 

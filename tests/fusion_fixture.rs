@@ -215,6 +215,104 @@ fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
     Ok(())
 }
 
+#[test]
+fn derives_default_output_paths_from_bam_and_genes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    // No --output-* flags at all; run inside the fixture dir so the relative
+    // default paths land there.
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .current_dir(&fixture_dir)
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Derived from the BAM stem (`fusion`) and the requested gene (`BCR`).
+    assert!(
+        fixture_dir.join("fusion.BCR.tsv").exists(),
+        "expected derived TSV path"
+    );
+    assert!(
+        fixture_dir.join("fusion.BCR.fasta.gz").exists(),
+        "expected derived FASTA path"
+    );
+    // The VCF stays opt-in, so it must not be written without the flag.
+    assert!(
+        !fixture_dir.join("fusion.BCR.vcf").exists(),
+        "VCF should not be written unless --output-vcf is given"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn bare_output_vcf_flag_uses_derived_default_path() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .current_dir(&fixture_dir)
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--partner-gene")
+        .arg("ABL1")
+        // Flag given with no value: the path is derived.
+        .arg("--output-vcf")
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Partner gene joins the gene token, so outputs are `fusion.BCR_ABL1.*`.
+    assert!(
+        fixture_dir.join("fusion.BCR_ABL1.vcf").exists(),
+        "expected derived VCF path"
+    );
+    assert!(fixture_dir.join("fusion.BCR_ABL1.tsv").exists());
+    assert!(fixture_dir.join("fusion.BCR_ABL1.fasta.gz").exists());
+
+    let vcf = fs::read_to_string(fixture_dir.join("fusion.BCR_ABL1.vcf"))?;
+    assert!(vcf.contains("##fileformat=VCFv4.2"));
+    assert!(vcf.contains("GENE1=BCR"));
+    assert!(vcf.contains("GENE2=ABL1"));
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
