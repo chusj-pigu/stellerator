@@ -93,6 +93,7 @@ cargo run -- \
 - `--output-fasta`: gzipped FASTA output path (default: `<bam-basename>.<genes>.fasta.gz`)
 - `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use `<bam-basename>.<genes>.vcf`; omit the flag entirely to skip the VCF
 - `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
+- `--include-duplicates`: include reads flagged as PCR/optical duplicates; they are skipped by default
 - `--threads`: rayon worker count
 - `--verbose`: enable debug logging
 - `--log-file`: optional log file path

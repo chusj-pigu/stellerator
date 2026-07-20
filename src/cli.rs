@@ -49,6 +49,12 @@ pub struct Args {
         help = "Breakpoint clustering tolerance in bp for consensus SV calling"
     )]
     pub sv_slop: usize,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Include reads flagged as PCR/optical duplicates; they are skipped by default"
+    )]
+    pub include_duplicates: bool,
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub threads: usize,
     #[arg(long, action = ArgAction::SetTrue)]

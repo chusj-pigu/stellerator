@@ -96,17 +96,17 @@ pub fn run(args: Args) -> Result<()> {
         .flat_map(|sample| query_spans.iter().map(move |span| (sample, span)))
         .collect();
 
-    work.par_iter().try_for_each(|&(sample, span)| {
-        process_span(
-            sample,
-            span,
-            partner_spans.as_deref(),
-            require_partner_match,
-            &tsv_writer,
-            &fasta_writer,
-            junctions.as_ref(),
-        )
-    })?;
+    let scan = SpanScan {
+        partner_spans: partner_spans.as_deref(),
+        require_partner_match,
+        tsv_writer: &tsv_writer,
+        fasta_writer: &fasta_writer,
+        junctions: junctions.as_ref(),
+        options: ScanOptions::from_args(&args),
+    };
+
+    work.par_iter()
+        .try_for_each(|&(sample, span)| process_span(sample, span, &scan))?;
 
     let fasta_writer = Arc::into_inner(fasta_writer)
         .ok_or_else(|| anyhow!("failed to reclaim FASTA writer"))?
@@ -415,15 +415,18 @@ fn has_associated_index(bam_path: &Path) -> bool {
     bam_bai.exists() || bam_csi.exists()
 }
 
-fn process_span(
-    sample: &BamSample,
-    span: &GeneSpan,
-    partner_spans: Option<&[GeneSpan]>,
+/// Shared, read-only state for scanning gene spans: where results go and how
+/// records are filtered. Held once per run and borrowed by every worker.
+struct SpanScan<'a> {
+    partner_spans: Option<&'a [GeneSpan]>,
     require_partner_match: bool,
-    tsv_writer: &Arc<Mutex<BufWriter<File>>>,
-    fasta_writer: &Arc<Mutex<FastaWriter>>,
-    junctions: Option<&Mutex<Vec<Junction>>>,
-) -> Result<()> {
+    tsv_writer: &'a Arc<Mutex<BufWriter<File>>>,
+    fasta_writer: &'a Arc<Mutex<FastaWriter>>,
+    junctions: Option<&'a Mutex<Vec<Junction>>>,
+    options: ScanOptions,
+}
+
+fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Result<()> {
     debug!(
         sample = sample.name,
         gene = span.gene,
@@ -445,12 +448,13 @@ fn process_span(
             &sample.header,
             &sample.name,
             span,
-            partner_spans,
-            require_partner_match,
+            scan.partner_spans,
+            scan.require_partner_match,
             &record,
+            scan.options,
         ) {
-            write_hit(tsv_writer, fasta_writer, &hit)?;
-            if let Some(collector) = junctions {
+            write_hit(scan.tsv_writer, scan.fasta_writer, &hit)?;
+            if let Some(collector) = scan.junctions {
                 collector
                     .lock()
                     .map_err(|_| anyhow!("junction collector lock was poisoned"))?
@@ -487,6 +491,20 @@ struct ReadContext {
     sa_tag: String,
 }
 
+/// Read-filtering options applied to every scanned record.
+#[derive(Debug, Clone, Copy)]
+struct ScanOptions {
+    include_duplicates: bool,
+}
+
+impl ScanOptions {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            include_duplicates: args.include_duplicates,
+        }
+    }
+}
+
 fn classify_record(
     header: &sam::Header,
     sample: &str,
@@ -494,8 +512,9 @@ fn classify_record(
     partner_spans: Option<&[GeneSpan]>,
     require_partner_match: bool,
     record: &bam::Record,
+    options: ScanOptions,
 ) -> Vec<Hit> {
-    let Some(context) = read_context(header, record) else {
+    let Some(context) = read_context(header, record, options) else {
         return Vec::new();
     };
 
@@ -515,10 +534,20 @@ fn classify_record(
 }
 
 /// Compute the per-read context, or `None` if the record cannot support a fusion
-/// call (unmapped, secondary, missing `SA` tag, or no sequence).
-fn read_context(header: &sam::Header, record: &bam::Record) -> Option<ReadContext> {
+/// call (unmapped, secondary, duplicate, missing `SA` tag, or no sequence).
+fn read_context(
+    header: &sam::Header,
+    record: &bam::Record,
+    options: ScanOptions,
+) -> Option<ReadContext> {
     let flags = record.flags();
     if flags.is_unmapped() || flags.is_secondary() {
+        return None;
+    }
+
+    // PCR/optical duplicates inflate apparent support, so drop them unless the
+    // caller opts in.
+    if flags.is_duplicate() && !options.include_duplicates {
         return None;
     }
 
@@ -1187,6 +1216,7 @@ mod tests {
             output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
+            include_duplicates: false,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1256,6 +1286,7 @@ mod tests {
             output_fasta: None,
             output_vcf: None,
             sv_slop: 10,
+            include_duplicates: false,
             threads: 1,
             verbose: false,
             log_file: None,

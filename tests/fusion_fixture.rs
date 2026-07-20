@@ -313,6 +313,53 @@ fn bare_output_vcf_flag_uses_derived_default_path() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[test]
+fn skips_duplicate_flagged_reads_unless_included() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("dups.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam_reads(
+        &bam_path,
+        &[
+            ("keep-read", Flags::empty()),
+            ("dup-read", Flags::DUPLICATE),
+        ],
+    )?;
+
+    // By default the duplicate-flagged read must not contribute support.
+    let default_tsv = fixture_dir.join("default.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &default_tsv,
+        &fixture_dir.join("default.fasta.gz"),
+        &[],
+    )?;
+    let tsv = fs::read_to_string(&default_tsv)?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(tsv.contains("keep-read"), "{tsv}");
+    assert!(!tsv.contains("dup-read"), "{tsv}");
+
+    // Opting in restores it.
+    let included_tsv = fixture_dir.join("included.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &included_tsv,
+        &fixture_dir.join("included.fasta.gz"),
+        &["--include-duplicates"],
+    )?;
+    let tsv = fs::read_to_string(&included_tsv)?;
+    assert_eq!(tsv.lines().count(), 3, "expected header + 2 rows\n{tsv}");
+    assert!(tsv.contains("keep-read"), "{tsv}");
+    assert!(tsv.contains("dup-read"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -332,6 +379,15 @@ chr9\tstellerator\texon\t400\t450\t.\t-\t.\tID=exon-ABL1-2;Parent=txABL1
 }
 
 fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    write_indexed_bam_reads(path, &[(read_name, Flags::empty())])
+}
+
+/// Write an indexed BAM containing one split-read record per entry, each with
+/// the given name and flags.
+fn write_indexed_bam_reads(
+    path: &Path,
+    reads: &[(&str, Flags)],
+) -> Result<(), Box<dyn std::error::Error>> {
     let header: sam::Header = "\
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr9\tLN:1000
@@ -340,36 +396,77 @@ fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::er
     .parse()?;
 
     let sequence = "ACGT".repeat(25);
-    let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
-        .into_iter()
-        .collect();
-    let data: Data = [(
-        Tag::OTHER_ALIGNMENTS,
-        Value::from("chr9,420,-,20S80M,60,0;"),
-    )]
-    .into_iter()
-    .collect();
-
-    let record = RecordBuf::builder()
-        .set_name(read_name)
-        .set_flags(Flags::empty())
-        .set_reference_sequence_id(1)
-        .set_alignment_start(Position::try_from(120)?)
-        .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
-        .set_cigar(cigar)
-        .set_sequence(Sequence::from(sequence.as_bytes()))
-        .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
-        .set_data(data)
-        .build();
-
     let file = File::create(path)?;
     let mut writer = bam::io::Writer::new(file);
     writer.write_header(&header)?;
-    writer.write_alignment_record(&header, &record)?;
+
+    for (read_name, flags) in reads {
+        let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+            .into_iter()
+            .collect();
+        let data: Data = [(
+            Tag::OTHER_ALIGNMENTS,
+            Value::from("chr9,420,-,20S80M,60,0;"),
+        )]
+        .into_iter()
+        .collect();
+
+        let record = RecordBuf::builder()
+            .set_name(*read_name)
+            .set_flags(*flags)
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(120)?)
+            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+            .set_data(data)
+            .build();
+
+        writer.write_alignment_record(&header, &record)?;
+    }
+
     writer.try_finish()?;
 
     let index = bam::fs::index(path)?;
     bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Run the CLI against a fixture, asserting it succeeded.
+fn run_extract(
+    bam: &Path,
+    annotation: &Path,
+    output_tsv: &Path,
+    output_fasta: &Path,
+    extra: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stellerator"));
+    command
+        .arg("--bam")
+        .arg(bam)
+        .arg("--annotation")
+        .arg(annotation)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(output_tsv)
+        .arg("--output-fasta")
+        .arg(output_fasta)
+        .arg("--threads")
+        .arg("1");
+    for arg in extra {
+        command.arg(arg);
+    }
+
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     Ok(())
 }
