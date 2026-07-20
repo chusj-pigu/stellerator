@@ -3,6 +3,7 @@ mod cli;
 mod fasta;
 mod logging;
 mod pipeline;
+mod vcf;
 
 use anyhow::Result;
 

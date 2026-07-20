@@ -32,7 +32,7 @@ fn extracts_fusion_read_and_infers_partner_annotation() -> Result<(), Box<dyn st
     let output_fasta = fixture_dir.join("stellerator.fasta.gz");
 
     write_annotation(&annotation_path)?;
-    write_indexed_bam(&bam_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
         .arg("--bam")
@@ -71,13 +71,243 @@ fn extracts_fusion_read_and_infers_partner_annotation() -> Result<(), Box<dyn st
     assert_eq!(values[14], "chr9");
     assert_eq!(values[15], "420");
     assert_eq!(values[16], "-");
+    assert_eq!(values[18], "fusion");
 
     let fasta = read_gzip_to_string(&output_fasta)?;
     assert!(fasta.contains(">fusion-read-1 gene=BCR matched_partner_gene=ABL1"));
     assert!(fasta.contains("partner_transcript_id=txABL1"));
     assert!(fasta.contains("breakpoint_estimate=exon1/exon1"));
     assert!(fasta.contains("partner=chr9:420 strand=-"));
+    assert!(fasta.contains("sample=fusion"));
     assert!(fasta.contains("ACGTACGTACGT"));
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn aggregates_multiple_bams_from_directory_with_sample_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_dir = fixture_dir.join("bams");
+    fs::create_dir(&bam_dir)?;
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_tsv = fixture_dir.join("stellerator.tsv");
+    let output_fasta = fixture_dir.join("stellerator.fasta.gz");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_dir.join("sampleA.bam"), "read-A")?;
+    write_indexed_bam(&bam_dir.join("sampleB.bam"), "read-B")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_dir)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&output_tsv)
+        .arg("--output-fasta")
+        .arg(&output_fasta)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tsv = fs::read_to_string(&output_tsv)?;
+    let rows: Vec<_> = tsv.lines().collect();
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected header plus one row per sample\n{tsv}"
+    );
+
+    let mut samples: Vec<&str> = rows[1..]
+        .iter()
+        .map(|row| row.split('\t').next_back().unwrap())
+        .collect();
+    samples.sort_unstable();
+    assert_eq!(samples, vec!["sampleA", "sampleB"]);
+
+    let fasta = read_gzip_to_string(&output_fasta)?;
+    assert!(fasta.contains(">read-A gene=BCR"));
+    assert!(fasta.contains(">read-B gene=BCR"));
+    assert!(fasta.contains("sample=sampleA"));
+    assert!(fasta.contains("sample=sampleB"));
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_tsv = fixture_dir.join("stellerator.tsv");
+    let output_fasta = fixture_dir.join("stellerator.fasta.gz");
+    let output_vcf = fixture_dir.join("stellerator.vcf");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&output_tsv)
+        .arg("--output-fasta")
+        .arg(&output_fasta)
+        .arg("--output-vcf")
+        .arg(&output_vcf)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    assert!(vcf.contains("##fileformat=VCFv4.2"));
+    assert!(vcf.contains("##contig=<ID=chr22,length=1000>"));
+
+    let header_line = vcf
+        .lines()
+        .find(|line| line.starts_with("#CHROM"))
+        .expect("VCF column header");
+    assert!(header_line.ends_with("\tfusion"), "{header_line}");
+
+    let record = vcf
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .expect("a VCF record");
+    let cols: Vec<_> = record.split('\t').collect();
+    assert_eq!(cols[0], "chr22"); // query-side chromosome
+    assert_eq!(cols[3], "N"); // REF
+    assert_eq!(cols[4], "<BND>"); // ALT
+    assert_eq!(cols[6], "PASS"); // FILTER
+    assert!(cols[7].contains("SVTYPE=BND"));
+    assert!(cols[7].contains("CHR2=chr9"));
+    assert!(cols[7].contains("POS2=420"));
+    assert!(cols[7].contains("GENE1=BCR"));
+    assert!(cols[7].contains("GENE2=ABL1"));
+    assert!(cols[7].contains("SR=1"));
+    assert_eq!(cols[8], "SR"); // FORMAT
+    assert_eq!(cols[9], "1"); // supporting reads for sample 'fusion'
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn derives_default_output_paths_from_bam_and_genes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    // No --output-* flags at all; run inside the fixture dir so the relative
+    // default paths land there.
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .current_dir(&fixture_dir)
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Derived from the BAM stem (`fusion`) and the requested gene (`BCR`).
+    assert!(
+        fixture_dir.join("fusion.BCR.tsv").exists(),
+        "expected derived TSV path"
+    );
+    assert!(
+        fixture_dir.join("fusion.BCR.fasta.gz").exists(),
+        "expected derived FASTA path"
+    );
+    // The VCF stays opt-in, so it must not be written without the flag.
+    assert!(
+        !fixture_dir.join("fusion.BCR.vcf").exists(),
+        "VCF should not be written unless --output-vcf is given"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn bare_output_vcf_flag_uses_derived_default_path() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("fusion.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .current_dir(&fixture_dir)
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--partner-gene")
+        .arg("ABL1")
+        // Flag given with no value: the path is derived.
+        .arg("--output-vcf")
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stellerator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Partner gene joins the gene token, so outputs are `fusion.BCR_ABL1.*`.
+    assert!(
+        fixture_dir.join("fusion.BCR_ABL1.vcf").exists(),
+        "expected derived VCF path"
+    );
+    assert!(fixture_dir.join("fusion.BCR_ABL1.tsv").exists());
+    assert!(fixture_dir.join("fusion.BCR_ABL1.fasta.gz").exists());
+
+    let vcf = fs::read_to_string(fixture_dir.join("fusion.BCR_ABL1.vcf"))?;
+    assert!(vcf.contains("##fileformat=VCFv4.2"));
+    assert!(vcf.contains("GENE1=BCR"));
+    assert!(vcf.contains("GENE2=ABL1"));
 
     fs::remove_dir_all(fixture_dir)?;
     Ok(())
@@ -101,7 +331,7 @@ chr9\tstellerator\texon\t400\t450\t.\t-\t.\tID=exon-ABL1-2;Parent=txABL1
     Ok(())
 }
 
-fn write_indexed_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let header: sam::Header = "\
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr9\tLN:1000
@@ -121,7 +351,7 @@ fn write_indexed_bam(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     .collect();
 
     let record = RecordBuf::builder()
-        .set_name("fusion-read-1")
+        .set_name(read_name)
         .set_flags(Flags::empty())
         .set_reference_sequence_id(1)
         .set_alignment_start(Position::try_from(120)?)

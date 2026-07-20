@@ -1,6 +1,9 @@
 /target/
 /test_data/output/
 
+# Local agent/editor settings
+.claude/settings.local.json
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
