@@ -7,41 +7,14 @@ use std::{
 
 use anyhow::{Context, Result};
 
-/// How a supporting read connects the two breakends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Evidence {
-    /// A supplementary (`SA`) alignment crosses the junction.
-    Split,
-    /// The read's mate maps to the partner locus.
-    Discordant,
-}
-
-impl Evidence {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Evidence::Split => "split",
-            Evidence::Discordant => "discordant",
-        }
-    }
-}
-
-/// Per-sample supporting-read counts, split by evidence class.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SampleSupport {
-    pub split: usize,
-    pub discordant: usize,
-}
-
 /// A single supporting-read breakend observation produced by the pipeline.
 ///
 /// Each candidate fusion-supporting read contributes one junction per
-/// supplementary (`SA`) alignment that escapes the queried gene interval, plus
-/// one more when its mate provides discordant-pair evidence.
+/// supplementary (`SA`) alignment that escapes the queried gene interval.
 #[derive(Clone)]
 pub struct Junction {
     pub sample: String,
     pub read_name: String,
-    pub evidence: Evidence,
     pub query_gene: String,
     pub partner_gene: Option<String>,
     pub query_transcript: String,
@@ -69,9 +42,8 @@ pub struct StructuralVariant {
     pub transcript1: String,
     pub transcript2: String,
     pub region: String,
-    pub support_split: usize,
-    pub support_discordant: usize,
-    pub support_by_sample: BTreeMap<String, SampleSupport>,
+    pub support_total: usize,
+    pub support_by_sample: BTreeMap<String, usize>,
 }
 
 /// Discrete key that breakends must share before position-tolerance clustering.
@@ -138,31 +110,13 @@ pub fn cluster_consensus(mut junctions: Vec<Junction>, slop: usize) -> Vec<Struc
 fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
     let anchor = &cluster[0];
 
-    let mut support_by_sample: BTreeMap<String, SampleSupport> = BTreeMap::new();
-    let mut seen: HashSet<(&str, &str, Evidence)> = HashSet::new();
-    let mut support_split = 0;
-    let mut support_discordant = 0;
+    let mut support_by_sample: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for junction in cluster {
-        // A read counts once per evidence class, so a read that is both split
-        // and discordant contributes to each tally exactly once.
-        if seen.insert((
-            junction.sample.as_str(),
-            junction.read_name.as_str(),
-            junction.evidence,
-        )) {
-            let entry = support_by_sample
+        if seen.insert((junction.sample.as_str(), junction.read_name.as_str())) {
+            *support_by_sample
                 .entry(junction.sample.clone())
-                .or_default();
-            match junction.evidence {
-                Evidence::Split => {
-                    entry.split += 1;
-                    support_split += 1;
-                }
-                Evidence::Discordant => {
-                    entry.discordant += 1;
-                    support_discordant += 1;
-                }
-            }
+                .or_insert(0) += 1;
         }
     }
 
@@ -181,8 +135,7 @@ fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
         transcript1: anchor.query_transcript.clone(),
         transcript2: anchor.partner_transcript.clone(),
         region: format!("{}/{}", anchor.query_region, anchor.partner_region),
-        support_split,
-        support_discordant,
+        support_total: seen.len(),
         support_by_sample,
     }
 }
@@ -255,19 +208,11 @@ pub fn write_vcf(
     )?;
     writeln!(
         writer,
-        "##INFO=<ID=SR,Number=1,Type=Integer,Description=\"Split reads supporting the junction across all samples\">"
+        "##INFO=<ID=SR,Number=1,Type=Integer,Description=\"Total supporting reads across samples\">"
     )?;
     writeln!(
         writer,
-        "##INFO=<ID=PE,Number=1,Type=Integer,Description=\"Discordant read pairs supporting the junction across all samples\">"
-    )?;
-    writeln!(
-        writer,
-        "##FORMAT=<ID=SR,Number=1,Type=Integer,Description=\"Split reads supporting the junction in the sample\">"
-    )?;
-    writeln!(
-        writer,
-        "##FORMAT=<ID=PE,Number=1,Type=Integer,Description=\"Discordant read pairs supporting the junction in the sample\">"
+        "##FORMAT=<ID=SR,Number=1,Type=Integer,Description=\"Supporting reads in the sample\">"
     )?;
     for (name, length) in contigs {
         match length {
@@ -287,7 +232,7 @@ pub fn write_vcf(
 
     for (index, variant) in variants.iter().enumerate() {
         let info = format!(
-            "SVTYPE=BND;CHR2={};POS2={};STRANDS={}{};GENE1={};GENE2={};TRANSCRIPT1={};TRANSCRIPT2={};REGION={};SR={};PE={}",
+            "SVTYPE=BND;CHR2={};POS2={};STRANDS={}{};GENE1={};GENE2={};TRANSCRIPT1={};TRANSCRIPT2={};REGION={};SR={}",
             variant.chrom2,
             variant.pos2,
             variant.strand1,
@@ -297,24 +242,19 @@ pub fn write_vcf(
             variant.transcript1,
             variant.transcript2,
             variant.region,
-            variant.support_split,
-            variant.support_discordant,
+            variant.support_total,
         );
         write!(
             writer,
-            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tSR:PE",
+            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tSR",
             variant.chrom1,
             variant.pos1,
             index + 1,
             info,
         )?;
         for sample in samples {
-            let support = variant
-                .support_by_sample
-                .get(sample)
-                .copied()
-                .unwrap_or_default();
-            write!(writer, "\t{}:{}", support.split, support.discordant)?;
+            let support = variant.support_by_sample.get(sample).copied().unwrap_or(0);
+            write!(writer, "\t{support}")?;
         }
         writeln!(writer)?;
     }
@@ -328,20 +268,9 @@ mod tests {
     use super::*;
 
     fn junction(sample: &str, read: &str, pos1: usize, pos2: usize) -> Junction {
-        evidence_junction(sample, read, pos1, pos2, Evidence::Split)
-    }
-
-    fn evidence_junction(
-        sample: &str,
-        read: &str,
-        pos1: usize,
-        pos2: usize,
-        evidence: Evidence,
-    ) -> Junction {
         Junction {
             sample: sample.to_string(),
             read_name: read.to_string(),
-            evidence,
             query_gene: "BCR".to_string(),
             partner_gene: Some("ABL1".to_string()),
             query_transcript: "txBCR".to_string(),
@@ -369,10 +298,9 @@ mod tests {
         assert_eq!(variants.len(), 1);
 
         let variant = &variants[0];
-        assert_eq!(variant.support_split, 3);
-        assert_eq!(variant.support_discordant, 0);
-        assert_eq!(variant.support_by_sample["s1"].split, 2);
-        assert_eq!(variant.support_by_sample["s2"].split, 1);
+        assert_eq!(variant.support_total, 3);
+        assert_eq!(variant.support_by_sample.get("s1"), Some(&2));
+        assert_eq!(variant.support_by_sample.get("s2"), Some(&1));
         assert_eq!(variant.gene1, "BCR");
         assert_eq!(variant.gene2, "ABL1");
         assert_eq!(variant.pos1, 101);
@@ -400,28 +328,8 @@ mod tests {
 
         let variants = cluster_consensus(junctions, 10);
         assert_eq!(variants.len(), 1);
-        assert_eq!(variants[0].support_split, 1);
-        assert_eq!(variants[0].support_by_sample["s1"].split, 1);
-    }
-
-    #[test]
-    fn tallies_split_and_discordant_support_separately() {
-        // The same read supplies both evidence classes for one junction; each
-        // class counts it once.
-        let junctions = vec![
-            evidence_junction("s1", "r1", 100, 400, Evidence::Split),
-            evidence_junction("s1", "r1", 101, 401, Evidence::Discordant),
-            evidence_junction("s1", "r2", 102, 402, Evidence::Discordant),
-        ];
-
-        let variants = cluster_consensus(junctions, 10);
-        assert_eq!(variants.len(), 1);
-
-        let variant = &variants[0];
-        assert_eq!(variant.support_split, 1);
-        assert_eq!(variant.support_discordant, 2);
-        assert_eq!(variant.support_by_sample["s1"].split, 1);
-        assert_eq!(variant.support_by_sample["s1"].discordant, 2);
+        assert_eq!(variants[0].support_total, 1);
+        assert_eq!(variants[0].support_by_sample.get("s1"), Some(&1));
     }
 
     #[test]
