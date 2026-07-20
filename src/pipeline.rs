@@ -18,7 +18,7 @@ use noodles_sam::{
 };
 use rayon::{ThreadPoolBuilder, prelude::*};
 use serde::Serialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
@@ -58,6 +58,14 @@ pub fn run(args: Args) -> Result<()> {
             .num_threads(args.threads)
             .build_global()
             .map_err(|error| anyhow!("failed to configure rayon thread pool: {error}"))?;
+    }
+
+    if args.min_mapq == 0 {
+        warn!(
+            "--min-mapq is 0: taking every alignment regardless of mapping quality. \
+             Output may include low-quality and multi-mapping reads, which are a common \
+             source of spurious fusion candidates; raise --min-mapq to filter them."
+        );
     }
 
     let samples = open_bam_samples(&args.bam)?;
@@ -495,12 +503,14 @@ struct ReadContext {
 #[derive(Debug, Clone, Copy)]
 struct ScanOptions {
     include_duplicates: bool,
+    min_mapq: u8,
 }
 
 impl ScanOptions {
     fn from_args(args: &Args) -> Self {
         Self {
             include_duplicates: args.include_duplicates,
+            min_mapq: args.min_mapq,
         }
     }
 }
@@ -548,6 +558,15 @@ fn read_context(
     // PCR/optical duplicates inflate apparent support, so drop them unless the
     // caller opts in.
     if flags.is_duplicate() && !options.include_duplicates {
+        return None;
+    }
+
+    // A floor of 0 takes everything. Above that, drop alignments below the
+    // threshold, including records with no reported MAPQ since their quality
+    // cannot be verified.
+    if options.min_mapq > 0
+        && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+    {
         return None;
     }
 
@@ -1217,6 +1236,7 @@ mod tests {
             output_vcf: None,
             sv_slop: 10,
             include_duplicates: false,
+            min_mapq: 0,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1287,6 +1307,7 @@ mod tests {
             output_vcf: None,
             sv_slop: 10,
             include_duplicates: false,
+            min_mapq: 0,
             threads: 1,
             verbose: false,
             log_file: None,

@@ -94,6 +94,7 @@ cargo run -- \
 - `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use `<bam-basename>.<genes>.vcf`; omit the flag entirely to skip the VCF
 - `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
 - `--include-duplicates`: include reads flagged as PCR/optical duplicates; they are skipped by default
+- `--min-mapq`: minimum mapping quality for a read to be considered; `0` (the default) takes every alignment and logs a warning
 - `--threads`: rayon worker count
 - `--verbose`: enable debug logging
 - `--log-file`: optional log file path
@@ -118,6 +119,15 @@ overwrite each other:
 So `--bam sampleA.bam --gene BCR --partner-gene ABL1` writes
 `sampleA.BCR_ABL1.tsv` and `sampleA.BCR_ABL1.fasta.gz`. Characters that are
 awkward in filenames are replaced with `_`.
+
+### Mapping quality
+
+`--min-mapq` defaults to `0`, so every alignment is considered. This favours
+sensitivity, which matters when hunting low-frequency fusions supported by only
+a handful of reads. The cost is that low-quality and multi-mapping alignments —
+a common source of spurious candidates over repeats and paralogues — are kept,
+so each run logs a warning when the floor is `0`. Raise `--min-mapq` (for
+example to `20`) to trade sensitivity for precision.
 
 ## Output
 

@@ -323,8 +323,8 @@ fn skips_duplicate_flagged_reads_unless_included() -> Result<(), Box<dyn std::er
     write_indexed_bam_reads(
         &bam_path,
         &[
-            ("keep-read", Flags::empty()),
-            ("dup-read", Flags::DUPLICATE),
+            ("keep-read", Flags::empty(), 60),
+            ("dup-read", Flags::DUPLICATE, 60),
         ],
     )?;
 
@@ -360,6 +360,69 @@ fn skips_duplicate_flagged_reads_unless_included() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[test]
+fn min_mapq_defaults_to_taking_everything_and_warns() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("mapq.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_bam_reads(
+        &bam_path,
+        &[
+            ("high-mapq", Flags::empty(), 60),
+            ("low-mapq", Flags::empty(), 5),
+        ],
+    )?;
+
+    // Default takes everything, including the poorly mapped read.
+    let default_tsv = fixture_dir.join("default.tsv");
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--output-tsv")
+        .arg(&default_tsv)
+        .arg("--output-fasta")
+        .arg(fixture_dir.join("default.fasta.gz"))
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+    assert!(output.status.success());
+
+    let tsv = fs::read_to_string(&default_tsv)?;
+    assert_eq!(tsv.lines().count(), 3, "expected header + 2 rows\n{tsv}");
+    assert!(tsv.contains("high-mapq"), "{tsv}");
+    assert!(tsv.contains("low-mapq"), "{tsv}");
+
+    // ...and says so, so an unfiltered run is never silent.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--min-mapq is 0"),
+        "expected a warning about taking every alignment\n{stderr}"
+    );
+
+    // Raising the floor drops the low-quality alignment.
+    let filtered_tsv = fixture_dir.join("filtered.tsv");
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &filtered_tsv,
+        &fixture_dir.join("filtered.fasta.gz"),
+        &["--min-mapq", "20"],
+    )?;
+    let tsv = fs::read_to_string(&filtered_tsv)?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(tsv.contains("high-mapq"), "{tsv}");
+    assert!(!tsv.contains("low-mapq"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -379,14 +442,14 @@ chr9\tstellerator\texon\t400\t450\t.\t-\t.\tID=exon-ABL1-2;Parent=txABL1
 }
 
 fn write_indexed_bam(path: &Path, read_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    write_indexed_bam_reads(path, &[(read_name, Flags::empty())])
+    write_indexed_bam_reads(path, &[(read_name, Flags::empty(), 60)])
 }
 
 /// Write an indexed BAM containing one split-read record per entry, each with
 /// the given name and flags.
 fn write_indexed_bam_reads(
     path: &Path,
-    reads: &[(&str, Flags)],
+    reads: &[(&str, Flags, u8)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let header: sam::Header = "\
 @HD\tVN:1.6\tSO:coordinate
@@ -400,7 +463,7 @@ fn write_indexed_bam_reads(
     let mut writer = bam::io::Writer::new(file);
     writer.write_header(&header)?;
 
-    for (read_name, flags) in reads {
+    for (read_name, flags, mapq) in reads {
         let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
             .into_iter()
             .collect();
@@ -416,7 +479,7 @@ fn write_indexed_bam_reads(
             .set_flags(*flags)
             .set_reference_sequence_id(1)
             .set_alignment_start(Position::try_from(120)?)
-            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_mapping_quality(MappingQuality::new(*mapq).expect("valid MAPQ"))
             .set_cigar(cigar)
             .set_sequence(Sequence::from(sequence.as_bytes()))
             .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
