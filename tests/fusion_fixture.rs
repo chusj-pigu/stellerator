@@ -208,8 +208,10 @@ fn emits_consensus_sv_vcf_with_gene_annotation_and_support()
     assert!(cols[7].contains("GENE1=BCR"));
     assert!(cols[7].contains("GENE2=ABL1"));
     assert!(cols[7].contains("SR=1"));
-    assert_eq!(cols[8], "SR"); // FORMAT
-    assert_eq!(cols[9], "1"); // supporting reads for sample 'fusion'
+    assert!(cols[7].contains("DP=1"));
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR"); // FORMAT
+    // The lone spanning read is the supporting read, so AF is 1.
+    assert_eq!(cols[9], "0/1:1:0,1:1.000000:1");
 
     fs::remove_dir_all(fixture_dir)?;
     Ok(())
@@ -423,6 +425,48 @@ fn min_mapq_defaults_to_taking_everything_and_warns() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[test]
+fn reports_low_allele_fraction_against_spanning_depth() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("lowfreq.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let output_vcf = fixture_dir.join("lowfreq.vcf");
+
+    write_annotation(&annotation_path)?;
+    // One supporting read against three non-supporting spanning reads.
+    write_indexed_bam_with_background(&bam_path, 3)?;
+
+    run_extract(
+        &bam_path,
+        &annotation_path,
+        &fixture_dir.join("lowfreq.tsv"),
+        &fixture_dir.join("lowfreq.fasta.gz"),
+        &["--output-vcf", output_vcf.to_str().unwrap()],
+    )?;
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    let record = vcf
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .expect("a VCF record");
+    let cols: Vec<&str> = record.split('\t').collect();
+
+    // Only the split read supports the junction, but four reads span it.
+    assert!(cols[7].contains("SR=1"), "{record}");
+    assert!(cols[7].contains("DP=4"), "{record}");
+    assert!(cols[7].contains("AF=0.250000"), "{record}");
+    assert_eq!(cols[8], "GT:DP:AD:AF:SR");
+    assert_eq!(cols[9], "0/1:4:3,1:0.250000:1", "{record}");
+
+    // The background reads must not be reported as candidates themselves.
+    let tsv = fs::read_to_string(fixture_dir.join("lowfreq.tsv"))?;
+    assert_eq!(tsv.lines().count(), 2, "expected header + 1 row\n{tsv}");
+    assert!(!tsv.contains("background-"), "{tsv}");
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,
@@ -491,6 +535,72 @@ fn write_indexed_bam_reads(
 
     writer.try_finish()?;
 
+    let index = bam::fs::index(path)?;
+    bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
+
+    Ok(())
+}
+
+/// Write an indexed BAM with one split read plus `background` plain reads that
+/// span the same breakpoint without supporting any fusion, so the supporting
+/// read sits at a known low allele fraction.
+fn write_indexed_bam_with_background(
+    path: &Path,
+    background: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let header: sam::Header = "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr9\tLN:1000
+@SQ\tSN:chr22\tLN:1000
+"
+    .parse()?;
+
+    let file = File::create(path)?;
+    let mut writer = bam::io::Writer::new(file);
+    writer.write_header(&header)?;
+
+    // Background first to keep the file coordinate sorted: 100M from 100 spans
+    // the breakpoint at 139 without carrying an SA tag.
+    let background_sequence = "ACGT".repeat(25);
+    for index in 0..background {
+        let cigar: Cigar = [Op::new(Kind::Match, 100)].into_iter().collect();
+        let record = RecordBuf::builder()
+            .set_name(format!("background-{index}"))
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::try_from(100)?)
+            .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(background_sequence.as_bytes()))
+            .set_quality_scores(QualityScores::from(vec![30; background_sequence.len()]))
+            .build();
+        writer.write_alignment_record(&header, &record)?;
+    }
+
+    let sequence = "ACGT".repeat(25);
+    let cigar: Cigar = [Op::new(Kind::Match, 20), Op::new(Kind::SoftClip, 80)]
+        .into_iter()
+        .collect();
+    let data: Data = [(
+        Tag::OTHER_ALIGNMENTS,
+        Value::from("chr9,420,-,20S80M,60,0;"),
+    )]
+    .into_iter()
+    .collect();
+    let record = RecordBuf::builder()
+        .set_name("fusion-read-1")
+        .set_flags(Flags::empty())
+        .set_reference_sequence_id(1)
+        .set_alignment_start(Position::try_from(120)?)
+        .set_mapping_quality(MappingQuality::new(60).expect("valid MAPQ"))
+        .set_cigar(cigar)
+        .set_sequence(Sequence::from(sequence.as_bytes()))
+        .set_quality_scores(QualityScores::from(vec![30; sequence.len()]))
+        .set_data(data)
+        .build();
+    writer.write_alignment_record(&header, &record)?;
+
+    writer.try_finish()?;
     let index = bam::fs::index(path)?;
     bam::bai::fs::write(path.with_extension("bam.bai"), &index)?;
 

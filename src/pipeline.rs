@@ -104,13 +104,14 @@ pub fn run(args: Args) -> Result<()> {
         .flat_map(|sample| query_spans.iter().map(move |span| (sample, span)))
         .collect();
 
+    let scan_options = ScanOptions::from_args(&args);
     let scan = SpanScan {
         partner_spans: partner_spans.as_deref(),
         require_partner_match,
         tsv_writer: &tsv_writer,
         fasta_writer: &fasta_writer,
         junctions: junctions.as_ref(),
-        options: ScanOptions::from_args(&args),
+        options: scan_options,
     };
 
     work.par_iter()
@@ -138,7 +139,19 @@ pub fn run(args: Args) -> Result<()> {
         let junctions = junctions
             .into_inner()
             .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
-        let variants = cluster_consensus(junctions, args.sv_slop);
+        let mut variants = cluster_consensus(junctions, args.sv_slop);
+
+        // Depth is only knowable once the consensus breakpoint is fixed, so
+        // re-query each call. Call counts are small, which keeps this cheap and
+        // preserves the streaming scan above.
+        for variant in &mut variants {
+            for sample in &samples {
+                let depth =
+                    spanning_read_count(sample, &variant.chrom1, variant.pos1, scan_options)?;
+                variant.depth_by_sample.insert(sample.name.clone(), depth);
+            }
+        }
+
         let sample_names = sample_names(&samples);
         let contigs = union_contigs(&samples);
         write_vcf(vcf_path, &variants, &sample_names, &contigs)?;
@@ -150,6 +163,61 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Count reads spanning a breakpoint in one sample, applying the same record
+/// filters as the main scan.
+///
+/// This is the denominator behind allele fraction: without it a support count
+/// cannot distinguish a clonal event from a handful of artefacts. Reads are
+/// counted by name so a read with several alignments over the position counts
+/// once, and supplementary alignments are skipped for the same reason.
+fn spanning_read_count(
+    sample: &BamSample,
+    reference_name: &str,
+    position: usize,
+    options: ScanOptions,
+) -> Result<usize> {
+    // A contig absent from this sample's header contributes no depth.
+    let known = sample
+        .header
+        .reference_sequences()
+        .keys()
+        .any(|name| String::from_utf8_lossy(name.as_ref()) == reference_name);
+    if !known {
+        return Ok(0);
+    }
+
+    let mut reader = bam::io::indexed_reader::Builder::default()
+        .build_from_path(&sample.path)
+        .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
+
+    let start = Position::try_from(position)
+        .map_err(|_| anyhow!("invalid breakpoint position {position}"))?;
+    let region = Region::new(reference_name.to_string(), start..=start);
+
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let query = reader.query(&sample.header, &region)?;
+    for result in query.records() {
+        let record = result?;
+        let flags = record.flags();
+        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+            continue;
+        }
+        if flags.is_duplicate() && !options.include_duplicates {
+            continue;
+        }
+        if options.min_mapq > 0
+            && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+        {
+            continue;
+        }
+        if let Some(name) = record.name() {
+            names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
+        }
+    }
+
+    Ok(names.len())
 }
 
 /// Deterministically ordered sample names for VCF genotype columns.

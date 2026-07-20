@@ -44,6 +44,42 @@ pub struct StructuralVariant {
     pub region: String,
     pub support_total: usize,
     pub support_by_sample: BTreeMap<String, usize>,
+    /// Reads spanning the consensus breakpoint per sample, filled in after
+    /// clustering by re-querying each BAM. Empty until then.
+    pub depth_by_sample: BTreeMap<String, usize>,
+}
+
+impl StructuralVariant {
+    /// Supporting reads for a sample (the ALT allele depth).
+    pub fn support(&self, sample: &str) -> usize {
+        self.support_by_sample.get(sample).copied().unwrap_or(0)
+    }
+
+    /// Reads spanning the breakpoint in a sample (total depth).
+    pub fn depth(&self, sample: &str) -> usize {
+        self.depth_by_sample.get(sample).copied().unwrap_or(0)
+    }
+
+    /// Fraction of spanning reads that support the junction.
+    pub fn allele_fraction(&self, sample: &str) -> f64 {
+        let depth = self.depth(sample);
+        if depth == 0 {
+            return 0.0;
+        }
+        (self.support(sample) as f64 / depth as f64).min(1.0)
+    }
+
+    pub fn total_depth(&self) -> usize {
+        self.depth_by_sample.values().sum()
+    }
+
+    pub fn total_allele_fraction(&self) -> f64 {
+        let depth = self.total_depth();
+        if depth == 0 {
+            return 0.0;
+        }
+        (self.support_total as f64 / depth as f64).min(1.0)
+    }
 }
 
 /// Discrete key that breakends must share before position-tolerance clustering.
@@ -137,6 +173,7 @@ fn finalize_cluster(cluster: &[Junction]) -> StructuralVariant {
         region: format!("{}/{}", anchor.query_region, anchor.partner_region),
         support_total: seen.len(),
         support_by_sample,
+        depth_by_sample: BTreeMap::new(),
     }
 }
 
@@ -212,6 +249,30 @@ pub fn write_vcf(
     )?;
     writeln!(
         writer,
+        "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Reads spanning the breakend across all samples\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Fraction of spanning reads supporting the junction across all samples\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype; nominal only, low-frequency fusions are not diploid states - use AF and AD\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Reads spanning the breakend in the sample\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Spanning reads not supporting, and supporting, the junction\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=AF,Number=1,Type=Float,Description=\"Fraction of spanning reads supporting the junction in the sample\">"
+    )?;
+    writeln!(
+        writer,
         "##FORMAT=<ID=SR,Number=1,Type=Integer,Description=\"Supporting reads in the sample\">"
     )?;
     for (name, length) in contigs {
@@ -244,17 +305,32 @@ pub fn write_vcf(
             variant.region,
             variant.support_total,
         );
+        let info = format!(
+            "{info};DP={};AF={:.6}",
+            variant.total_depth(),
+            variant.total_allele_fraction()
+        );
         write!(
             writer,
-            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tSR",
+            "{}\t{}\tSTL_BND_{}\tN\t<BND>\t.\tPASS\t{}\tGT:DP:AD:AF:SR",
             variant.chrom1,
             variant.pos1,
             index + 1,
             info,
         )?;
         for sample in samples {
-            let support = variant.support_by_sample.get(sample).copied().unwrap_or(0);
-            write!(writer, "\t{support}")?;
+            let support = variant.support(sample);
+            let depth = variant.depth(sample);
+            // Depth is measured at the consensus breakpoint, which can sit a
+            // base or two off an individual read's end, so clamp rather than
+            // underflow.
+            let reference = depth.saturating_sub(support);
+            let genotype = if support > 0 { "0/1" } else { "0/0" };
+            write!(
+                writer,
+                "\t{genotype}:{depth}:{reference},{support}:{:.6}:{support}",
+                variant.allele_fraction(sample)
+            )?;
         }
         writeln!(writer)?;
     }

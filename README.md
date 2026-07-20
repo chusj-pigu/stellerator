@@ -159,9 +159,28 @@ are merged into one call. Each record is a `BND` breakend with:
 - `CHROM`/`POS`: consensus query-side breakpoint (median of supporting reads)
 - `INFO`: `SVTYPE=BND`, mate locus (`CHR2`/`POS2`), `STRANDS`, gene annotations
   (`GENE1`/`GENE2`), transcripts used for labeling, breakpoint `REGION` labels,
-  and total supporting reads (`SR`)
-- one genotype column per sample with the per-sample supporting-read count
-  (`FORMAT/SR`)
+  and cohort-wide support (`SR`), depth (`DP`) and allele fraction (`AF`)
+- one genotype column per sample, `FORMAT/GT:DP:AD:AF:SR`
+
+#### Allele fraction and low-frequency fusions
+
+A support count on its own cannot separate a real subclonal fusion from a
+handful of artefacts: one supporting read means something very different at a
+depth of 5 than at a depth of 50,000. So once the consensus breakpoint is fixed,
+Stellerator re-queries each BAM at that position and counts the reads spanning
+it, applying the same duplicate and `--min-mapq` filters as the main scan. Reads
+are counted by name, and supplementary alignments are skipped, so a read spanning
+the position several times still counts once.
+
+That gives, per sample, `DP` (spanning reads), `AD` (non-supporting,supporting)
+and `AF` (supporting / spanning). A junction backed by one read out of four
+spanning reads is reported as `0/1:4:3,1:0.250000:1`.
+
+`GT` is nominal. Low-frequency somatic fusions are not diploid genotypes, so it
+is emitted as `0/1` whenever there is any support and `0/0` otherwise; treat
+`AF` and `AD` as the real signal. Note also that `DP` is measured at the
+consensus breakpoint, which can sit a base or two away from an individual read's
+clipped end.
 
 ## Development
 
