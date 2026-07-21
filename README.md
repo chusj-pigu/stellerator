@@ -246,4 +246,7 @@ bd ready --json
 bd list --json --status open
 ```
 
-Current tracked themes include integration fixtures and expanded fusion heuristics / partner annotation behavior.
+Remaining tracked work centres on validating defaults against real long-read
+data, in particular the `--sv-slop` clustering tolerance.
+
+See [CHANGELOG.md](CHANGELOG.md) for released changes.
