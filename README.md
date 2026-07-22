@@ -95,6 +95,7 @@ cargo run -- \
 - `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
 - `--include-duplicates`: include reads flagged as PCR/optical duplicates; they are skipped by default
 - `--min-mapq`: minimum mapping quality for a read to be considered; `0` (the default) takes every alignment and logs a warning
+- `--min-depth`: drop consensus VCF calls whose breakpoint has fewer than N spanning reads; `0` (the default) keeps every call
 - `--threads`: rayon worker count
 - `--verbose`: enable debug logging
 - `--log-file`: optional log file path
@@ -146,7 +147,9 @@ The TSV includes:
 
 ### FASTA
 
-The gzipped FASTA output contains the supporting read sequences. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
+The gzipped FASTA output contains the supporting read sequences, **one record per read**. Each FASTA header includes the query gene, matched partner gene if available, transcript IDs used for labeling, breakpoint estimate, inferred partner locus, and the source `sample` name.
+
+A chimeric read whose `SA` tag lists several supplementary alignments produces one TSV row per supplementary alignment but a single FASTA record, so a long read's sequence is never repeated; its header describes the first of those junctions.
 
 ### VCF
 
@@ -207,6 +210,21 @@ Non-supporting reads are counted only if they actually span the position, so
 is emitted as `0/1` whenever there is any support and `0/0` otherwise; treat
 `AF` and `AD` as the real signal.
 
+#### Filtering on depth
+
+`--min-depth` drops calls whose breakpoint is too thinly covered for the allele
+fraction to mean anything — a supporting read over a denominator of one or two
+says very little. It thresholds on `DP`, never on support: filtering on `SR`
+would remove exactly the low-frequency events the tool exists to find, so no
+such option is offered.
+
+It defaults to `0`, keeping every call. In multi-sample runs a call survives if
+**any** sample meets the threshold, so one shallow sample cannot sink a
+cohort-wide call. The filter applies only to the VCF, since depth is measured
+only for consensus calls; the TSV and FASTA still list every candidate read, and
+setting `--min-depth` without `--output-vcf` logs a warning rather than silently
+doing nothing.
+
 ## Development
 
 Run the standard checks from the repository root:
@@ -228,4 +246,7 @@ bd ready --json
 bd list --json --status open
 ```
 
-Current tracked themes include integration fixtures and expanded fusion heuristics / partner annotation behavior.
+Remaining tracked work centres on validating defaults against real long-read
+data, in particular the `--sv-slop` clustering tolerance.
+
+See [CHANGELOG.md](CHANGELOG.md) for released changes.

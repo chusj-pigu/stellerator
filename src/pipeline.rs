@@ -24,7 +24,7 @@ use crate::{
     annotation::{GeneSpan, breakpoint_annotation, load_target_spans},
     cli::Args,
     fasta::FastaWriter,
-    vcf::{Junction, cluster_consensus, write_vcf},
+    vcf::{Junction, StructuralVariant, cluster_consensus, write_vcf},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +66,12 @@ pub fn run(args: Args) -> Result<()> {
              Output may include low-quality and multi-mapping reads, which are a common \
              source of spurious fusion candidates; raise --min-mapq to filter them."
         );
+    }
+
+    // Depth only exists for consensus calls, so the filter is a silent no-op
+    // without a VCF to filter.
+    if args.min_depth > 0 && args.output_vcf.is_none() {
+        warn!("--min-depth only filters the consensus VCF and has no effect without --output-vcf");
     }
 
     let samples = open_bam_samples(&args.bam)?;
@@ -141,24 +147,42 @@ pub fn run(args: Args) -> Result<()> {
             .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
         let mut variants = cluster_consensus(junctions, args.sv_slop);
 
-        // Depth is only knowable once the consensus breakpoint is fixed, so
-        // re-query each call. Call counts are small, which keeps this cheap and
-        // preserves the streaming scan above.
-        for variant in &mut variants {
-            for sample in &samples {
-                let mut names =
-                    spanning_read_names(sample, &variant.chrom1, variant.pos1, scan_options)?;
+        // Depth is only knowable once the consensus breakpoint is fixed, so it
+        // is measured here rather than during the streaming scan. Each sample
+        // opens its reader once and walks every breakpoint, and samples run in
+        // parallel.
+        let per_sample: Vec<(String, Vec<usize>)> = samples
+            .par_iter()
+            .map(|sample| {
+                let depths = sample_depths(sample, &variants, scan_options)?;
+                Ok((sample.name.clone(), depths))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-                // A supporting read spans the junction by definition, even when
-                // clipping leaves its alignment ending short of the consensus
-                // breakpoint. Without this, AD would not sum to DP.
-                if let Some(support) = variant.support_reads(&sample.name) {
-                    names.extend(support.iter().cloned());
-                }
+        for (sample_name, depths) in per_sample {
+            for (variant, depth) in variants.iter_mut().zip(depths) {
+                variant.depth_by_sample.insert(sample_name.clone(), depth);
+            }
+        }
 
-                variant
-                    .depth_by_sample
-                    .insert(sample.name.clone(), names.len());
+        // Drop calls whose breakpoint is too thinly covered to interpret: an
+        // allele fraction over a denominator of one or two reads says little.
+        // A call survives if any single sample is deep enough, so one shallow
+        // sample cannot sink a cohort-wide call.
+        if args.min_depth > 0 {
+            let before = variants.len();
+            variants.retain(|variant| {
+                samples
+                    .iter()
+                    .any(|sample| variant.depth(&sample.name) >= args.min_depth)
+            });
+
+            let dropped = before - variants.len();
+            if dropped > 0 {
+                info!(
+                    "dropped {dropped} consensus call(s) below --min-depth {}",
+                    args.min_depth
+                );
             }
         }
 
@@ -182,53 +206,71 @@ pub fn run(args: Args) -> Result<()> {
 /// cannot distinguish a clonal event from a handful of artefacts. Reads are
 /// counted by name so a read with several alignments over the position counts
 /// once, and supplementary alignments are skipped for the same reason.
-fn spanning_read_names(
+fn sample_depths(
     sample: &BamSample,
-    reference_name: &str,
-    position: usize,
+    variants: &[StructuralVariant],
     options: ScanOptions,
-) -> Result<std::collections::BTreeSet<String>> {
-    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    // A contig absent from this sample's header contributes no depth.
-    let known = sample
-        .header
-        .reference_sequences()
-        .keys()
-        .any(|name| String::from_utf8_lossy(name.as_ref()) == reference_name);
-    if !known {
-        return Ok(names);
+) -> Result<Vec<usize>> {
+    if variants.is_empty() {
+        return Ok(Vec::new());
     }
 
+    // Opening an indexed reader parses the whole BAM index, so it is done once
+    // per sample and reused for every breakpoint rather than per call.
     let mut reader = bam::io::indexed_reader::Builder::default()
         .build_from_path(&sample.path)
         .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
 
-    let start = Position::try_from(position)
-        .map_err(|_| anyhow!("invalid breakpoint position {position}"))?;
-    let region = Region::new(reference_name.to_string(), start..=start);
+    let known_references: std::collections::HashSet<String> = sample
+        .header
+        .reference_sequences()
+        .keys()
+        .map(|name| String::from_utf8_lossy(name.as_ref()).into_owned())
+        .collect();
 
-    let query = reader.query(&sample.header, &region)?;
-    for result in query.records() {
-        let record = result?;
-        let flags = record.flags();
-        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
-            continue;
+    let mut depths = Vec::with_capacity(variants.len());
+
+    for variant in variants {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // A contig absent from this sample's header contributes no depth.
+        if known_references.contains(&variant.chrom1) {
+            let start = Position::try_from(variant.pos1)
+                .map_err(|_| anyhow!("invalid breakpoint position {}", variant.pos1))?;
+            let region = Region::new(variant.chrom1.clone(), start..=start);
+
+            let query = reader.query(&sample.header, &region)?;
+            for result in query.records() {
+                let record = result?;
+                let flags = record.flags();
+                if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+                    continue;
+                }
+                if flags.is_duplicate() && !options.include_duplicates {
+                    continue;
+                }
+                if options.min_mapq > 0
+                    && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
+                {
+                    continue;
+                }
+                if let Some(name) = record.name() {
+                    names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
+                }
+            }
         }
-        if flags.is_duplicate() && !options.include_duplicates {
-            continue;
+
+        // A supporting read spans the junction by definition, even when
+        // clipping leaves its alignment ending short of the consensus
+        // breakpoint. Without this, AD would not sum to DP.
+        if let Some(support) = variant.support_reads(&sample.name) {
+            names.extend(support.iter().cloned());
         }
-        if options.min_mapq > 0
-            && !matches!(record.mapping_quality(), Some(mapq) if u8::from(mapq) >= options.min_mapq)
-        {
-            continue;
-        }
-        if let Some(name) = record.name() {
-            names.insert(String::from_utf8_lossy(name.as_ref()).into_owned());
-        }
+
+        depths.push(names.len());
     }
 
-    Ok(names)
+    Ok(depths)
 }
 
 /// Deterministically ordered sample names for VCF genotype columns.
@@ -531,7 +573,7 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
     let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
         let record = result?;
-        for hit in classify_record(
+        let RecordHits { sequence, hits } = classify_record(
             &sample.header,
             &sample.name,
             span,
@@ -539,8 +581,18 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
             scan.require_partner_match,
             &record,
             scan.options,
-        ) {
-            write_hit(scan.tsv_writer, scan.fasta_writer, &hit)?;
+        );
+
+        for (index, hit) in hits.into_iter().enumerate() {
+            write_tsv_row(scan.tsv_writer, &hit)?;
+
+            // One FASTA record per read: a chimeric read supporting several
+            // junctions gets one row per junction in the TSV, but its sequence
+            // is written once. The header describes the first junction.
+            if index == 0 {
+                write_fasta_record(scan.fasta_writer, &hit.fasta_header, &sequence)?;
+            }
+
             if let Some(collector) = scan.junctions {
                 collector
                     .lock()
@@ -602,12 +654,15 @@ fn classify_record(
     require_partner_match: bool,
     record: &bam::Record,
     options: ScanOptions,
-) -> Vec<Hit> {
+) -> RecordHits {
     let Some(context) = read_context(header, record, options) else {
-        return Vec::new();
+        return RecordHits {
+            sequence: String::new(),
+            hits: Vec::new(),
+        };
     };
 
-    parse_sa_entries(&context.sa_tag)
+    let hits = parse_sa_entries(&context.sa_tag)
         .into_iter()
         .filter_map(|partner| {
             build_hit(
@@ -619,7 +674,12 @@ fn classify_record(
                 partner,
             )
         })
-        .collect()
+        .collect();
+
+    RecordHits {
+        sequence: context.sequence,
+        hits,
+    }
 }
 
 /// Compute the per-read context, or `None` if the record cannot support a fusion
@@ -795,7 +855,6 @@ fn build_hit(
             partner.strand,
             sample
         ),
-        fasta_sequence: context.sequence.clone(),
         junction,
     })
 }
@@ -990,11 +1049,7 @@ fn write_tsv_header(writer: &Arc<Mutex<BufWriter<File>>>) -> Result<()> {
     Ok(())
 }
 
-fn write_hit(
-    tsv_writer: &Arc<Mutex<BufWriter<File>>>,
-    fasta_writer: &Arc<Mutex<FastaWriter>>,
-    hit: &Hit,
-) -> Result<()> {
+fn write_tsv_row(tsv_writer: &Arc<Mutex<BufWriter<File>>>, hit: &Hit) -> Result<()> {
     {
         let mut writer = tsv_writer
             .lock()
@@ -1030,18 +1085,38 @@ fn write_hit(
         )?;
     }
 
+    Ok(())
+}
+
+/// Write one FASTA record for a read. Called once per record even when the read
+/// supports several junctions, so the sequence is not duplicated.
+fn write_fasta_record(
+    fasta_writer: &Arc<Mutex<FastaWriter>>,
+    header: &str,
+    sequence: &str,
+) -> Result<()> {
     let mut writer = fasta_writer
         .lock()
         .map_err(|_| anyhow!("FASTA writer lock was poisoned"))?;
-    writer.write_record(&hit.fasta_header, &hit.fasta_sequence)?;
+    writer.write_record(header, sequence)?;
     Ok(())
 }
 
 struct Hit {
     tsv: TsvRecord,
     fasta_header: String,
-    fasta_sequence: String,
     junction: Junction,
+}
+
+/// Everything one alignment record contributes: a hit per supplementary
+/// alignment, plus the read sequence held once.
+///
+/// The sequence lives here rather than on each [`Hit`] because a chimeric long
+/// read can carry many `SA` entries, and copying a multi-kilobase sequence per
+/// junction is expensive in both memory and FASTA volume.
+struct RecordHits {
+    sequence: String,
+    hits: Vec<Hit>,
 }
 
 struct PartnerAlignment {
@@ -1316,6 +1391,7 @@ mod tests {
             sv_slop: 10,
             include_duplicates: false,
             min_mapq: 0,
+            min_depth: 0,
             threads: 1,
             verbose: false,
             log_file: None,
@@ -1387,6 +1463,7 @@ mod tests {
             sv_slop: 10,
             include_duplicates: false,
             min_mapq: 0,
+            min_depth: 0,
             threads: 1,
             verbose: false,
             log_file: None,
