@@ -6,14 +6,17 @@ description = "Extract candidate fusion-supporting reads for target genes from i
 
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/chusj-pigu/stellerator"
 keywords = ["genomics", "bioinformatics", "bam"]
 categories = ["science", "command-line-utilities"]
 include = [
 "Cargo.toml",
 "Cargo.lock",
-"LICENSE*",
-"README*",
+"/LICENSE",
+"/README.md",
+"/CHANGELOG.md",
 "src/",
+"tests/",
 "images/",
 ]
 

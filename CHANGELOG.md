@@ -11,6 +11,9 @@ Notable changes to Stellerator. Versions follow [Semantic Versioning](https://se
   These are breaking `0.x` releases upstream, but no Stellerator code changed —
   the breaks were in API surface the project does not use, and the full test
   suite (including the end-to-end BAM write/index/query paths) passes unchanged.
+- Packaging for release: added the `repository` link, published the integration
+  tests and this changelog, and stopped bundling an internal `.beads/README.md`
+  that a broad `include` glob had been sweeping into the crate.
 
 ## 0.2.1
 

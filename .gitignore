@@ -4,6 +4,9 @@
 # Local agent/editor settings
 .claude/settings.local.json
 
+# Local, machine-specific run scripts (personal paths)
+/scripts/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
