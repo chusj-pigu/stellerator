@@ -2,6 +2,16 @@
 
 Notable changes to Stellerator. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.2.1
+
+### Changed
+
+- Refreshed semver-compatible dependencies (`anyhow`, `clap`, `rayon`, `serde`,
+  `serde_json`, `thiserror`, `tracing-appender`, and transitives). No behaviour
+  or API changes. The `noodles` crates were intentionally left at their pinned
+  versions, since newer minor releases are breaking and warrant a dedicated
+  migration.
+
 ## 0.2.0
 
 Reorients the tool toward detecting low-frequency fusions in long-read
