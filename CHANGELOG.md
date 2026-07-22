@@ -2,6 +2,16 @@
 
 Notable changes to Stellerator. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.2.2
+
+### Changed
+
+- Upgraded the `noodles` crates: `noodles-bam` 0.86→0.91, `noodles-sam`
+  0.82→0.86, `noodles-core` 0.19→0.20 (plus `noodles-bgzf` and `noodles-csi`).
+  These are breaking `0.x` releases upstream, but no Stellerator code changed —
+  the breaks were in API surface the project does not use, and the full test
+  suite (including the end-to-end BAM write/index/query paths) passes unchanged.
+
 ## 0.2.1
 
 ### Changed
