@@ -80,19 +80,52 @@ cargo run -- \
   --annotation /path/to/genes.gtf \
   --gene BCR \
   --output-vcf results/stellerator.vcf \
-  --sv-slop 10
+  --sv-slop 200
 ```
+
+### Batch mode
+
+Instead of `--gene`, pass `--loci FILE` to process many gene pairs in one run,
+each with its own partner constraint and clustering tolerance:
+
+```bash
+cargo run -- \
+  --bam cohort/ \
+  --annotation /path/to/genes.gtf \
+  --loci panel.tsv \
+  --output-vcf results/panel.vcf
+```
+
+The loci file has one job per line, `gene [partner] [tolerance]`, split on any
+whitespace:
+
+```
+# gene   partner   tolerance
+BCR      ABL1      50
+EWSR1    FLI1      200
+MYC      -         100     # no partner constraint, tolerance 100
+FOXO1                      # no partner, default tolerance
+```
+
+`#` starts a comment, blank lines are skipped, and an optional header (first
+field `gene`) is ignored. A partner of `-`, `.`, `NA`, or an absent column means
+"annotate against any overlapping gene" (as when `--partner-gene` is omitted); a
+tolerance that is absent or `-` falls back to `--sv-slop`. Every job's output is
+aggregated into the same TSV/FASTA/VCF, and each job's calls are clustered with
+its own tolerance. `--loci` is mutually exclusive with `--gene`, and
+`--partner-gene` is ignored (each row carries its own).
 
 ## CLI Arguments
 
 - `--bam`: one or more indexed BAM files, or directories of BAMs; repeat the flag or pass multiple paths (e.g. `--bam *.bam`)
 - `--annotation`: input GFF3 or GTF file
-- `--gene`: target gene to query; repeat for multiple genes
-- `--partner-gene`: optional partner gene constraint
-- `--output-tsv`: TSV output path (default: `<bam-basename>.<genes>.tsv`)
-- `--output-fasta`: gzipped FASTA output path (default: `<bam-basename>.<genes>.fasta.gz`)
-- `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use `<bam-basename>.<genes>.vcf`; omit the flag entirely to skip the VCF
-- `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 10)
+- `--gene`: target gene to query; repeat for multiple genes. Mutually exclusive with `--loci`
+- `--loci`: batch file of `gene [partner] [tolerance]` rows, one job per line; each is processed with its own partner and tolerance. Mutually exclusive with `--gene`
+- `--partner-gene`: optional partner gene constraint (ignored in `--loci` mode)
+- `--output-tsv`: TSV output path (default: `<bam-basename>.<genes>.tsv`, or `<bam-basename>.<loci-stem>.tsv` in batch mode)
+- `--output-fasta`: gzipped FASTA output path (default derived like the TSV)
+- `--output-vcf`: VCF output of consensus structural variants. Pass a path, or give the flag alone to use the derived name; omit the flag entirely to skip the VCF
+- `--sv-slop`: breakpoint clustering tolerance in bp for consensus SV calling (default 200; also the per-row fallback in `--loci` mode)
 - `--include-duplicates`: include reads flagged as PCR/optical duplicates; they are skipped by default
 - `--min-mapq`: minimum mapping quality for a read to be considered; `0` (the default) takes every alignment and logs a warning
 - `--min-depth`: drop consensus VCF calls whose breakpoint has fewer than N spanning reads; `0` (the default) keeps every call
@@ -180,12 +213,16 @@ fraction of the support; too loose and genuinely distinct junctions get merged.
 The first failure mode is the dangerous one for low-frequency work, where there
 are no spare reads to lose.
 
+The default is 200 bp, chosen for long reads, whose breakpoints scatter more
+than short-read aligners in indel-rich and homopolymer contexts.
+
 `CIPOS`/`CIPOS2` exist to make this measurable rather than guesswork. Run once
 with a deliberately generous `--sv-slop` so a real event stays in one cluster,
 then read the width of `CIPOS` to see how far breakpoints actually scatter in
-your data, and set the tolerance from that. For example, three reads of one
-junction scattering 11 bp report `CIPOS=-5,6` under `--sv-slop 100`, but split
-into a 2-read and a 1-read call under the default `--sv-slop 10`.
+your data, and tune from that. For example, three reads of one junction
+scattering 11 bp merge into a single call reporting `CIPOS=-5,6` under the
+default `--sv-slop 200`, but a tight `--sv-slop 5` fragments them into separate
+calls.
 
 #### Allele fraction and low-frequency fusions
 

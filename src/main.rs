@@ -1,6 +1,7 @@
 mod annotation;
 mod cli;
 mod fasta;
+mod loci;
 mod logging;
 mod pipeline;
 mod vcf;
