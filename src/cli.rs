@@ -19,10 +19,27 @@ pub struct Args {
     pub bam: Vec<PathBuf>,
     #[arg(long, value_name = "GFF_OR_GTF")]
     pub annotation: PathBuf,
-    #[arg(long = "gene", value_name = "GENE", required = true, num_args = 1..)]
+    #[arg(
+        long = "gene",
+        value_name = "GENE",
+        num_args = 1..,
+        required_unless_present = "loci",
+        conflicts_with = "loci",
+        help = "Target gene to query; repeat for multiple genes. Mutually exclusive with --loci"
+    )]
     pub genes: Vec<String>,
-    #[arg(long, value_name = "GENE")]
+    #[arg(
+        long,
+        value_name = "GENE",
+        help = "Restrict output to reads connecting the query gene(s) to this partner. Ignored in --loci mode, where each row carries its own partner"
+    )]
     pub partner_gene: Option<String>,
+    #[arg(
+        long,
+        value_name = "LOCI",
+        help = "Batch file of `gene [partner] [tolerance]` rows, one job per line; each is processed with its own partner constraint and clustering tolerance. Mutually exclusive with --gene"
+    )]
+    pub loci: Option<PathBuf>,
     #[arg(
         long,
         value_name = "TSV",
@@ -45,8 +62,8 @@ pub struct Args {
     #[arg(
         long,
         value_name = "BP",
-        default_value_t = 10,
-        help = "Breakpoint clustering tolerance in bp for consensus SV calling"
+        default_value_t = 200,
+        help = "Breakpoint clustering tolerance in bp for consensus SV calling (also the per-row fallback in --loci mode)"
     )]
     pub sv_slop: usize,
     #[arg(

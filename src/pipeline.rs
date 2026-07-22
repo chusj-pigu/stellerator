@@ -74,54 +74,79 @@ pub fn run(args: Args) -> Result<()> {
         warn!("--min-depth only filters the consensus VCF and has no effect without --output-vcf");
     }
 
+    // --partner-gene is a single global constraint; in batch mode each row
+    // carries its own, so the flag has no meaning there.
+    if args.loci.is_some() && args.partner_gene.is_some() {
+        warn!("--partner-gene is ignored in --loci mode; each row carries its own partner");
+    }
+
     let samples = open_bam_samples(&args.bam)?;
     info!("processing {} BAM sample(s)", samples.len());
 
-    let requested_genes = requested_gene_names(&args);
-    let annotation_genes = if args.partner_gene.is_some() {
-        requested_genes.clone()
-    } else {
+    let jobs = build_jobs(&args)?;
+
+    // Load only the referenced genes when every job names a partner; a job
+    // without one annotates against any overlapping gene and so needs them all.
+    let needs_all_spans = jobs.iter().any(|job| job.partner_gene.is_none());
+    let annotation_genes = if needs_all_spans {
         Vec::new()
+    } else {
+        referenced_genes(&jobs)
     };
     let all_spans = load_target_spans(&args.annotation, &annotation_genes)?;
-    let query_spans = query_spans(&all_spans, &args);
-    let partner_spans = partner_spans(&all_spans, &args);
-    let require_partner_match = args.partner_gene.is_some();
-    info!("loaded {} query intervals", query_spans.len());
 
-    let output_tsv = resolve_output_path(args.output_tsv.as_deref(), &samples, &args, "tsv");
-    let output_fasta =
-        resolve_output_path(args.output_fasta.as_deref(), &samples, &args, "fasta.gz");
+    let genes_token = output_genes_token(&args);
+    let output_tsv = resolve_output_path(args.output_tsv.as_deref(), &samples, &genes_token, "tsv");
+    let output_fasta = resolve_output_path(
+        args.output_fasta.as_deref(),
+        &samples,
+        &genes_token,
+        "fasta.gz",
+    );
     let output_vcf = args
         .output_vcf
         .as_ref()
-        .map(|explicit| resolve_output_path(explicit.as_deref(), &samples, &args, "vcf"));
+        .map(|explicit| resolve_output_path(explicit.as_deref(), &samples, &genes_token, "vcf"));
+
+    let plans: Vec<JobPlan> = jobs
+        .iter()
+        .map(|job| build_job_plan(job, &all_spans, output_vcf.is_some()))
+        .collect();
+    let query_interval_count: usize = plans.iter().map(|plan| plan.query_spans.len()).sum();
+    info!(
+        "loaded {} query interval(s) across {} job(s)",
+        query_interval_count,
+        plans.len()
+    );
 
     let tsv_writer = Arc::new(Mutex::new(create_tsv_writer(&output_tsv)?));
     let fasta_writer = Arc::new(Mutex::new(FastaWriter::create(&output_fasta)?));
-    let junctions = output_vcf
-        .as_ref()
-        .map(|_| Mutex::new(Vec::<Junction>::new()));
-
     write_tsv_header(&tsv_writer)?;
 
-    let work: Vec<(&BamSample, &GeneSpan)> = samples
-        .iter()
-        .flat_map(|sample| query_spans.iter().map(move |span| (sample, span)))
-        .collect();
-
     let scan_options = ScanOptions::from_args(&args);
-    let scan = SpanScan {
-        partner_spans: partner_spans.as_deref(),
-        require_partner_match,
-        tsv_writer: &tsv_writer,
-        fasta_writer: &fasta_writer,
-        junctions: junctions.as_ref(),
-        options: scan_options,
-    };
 
-    work.par_iter()
-        .try_for_each(|&(sample, span)| process_span(sample, span, &scan))?;
+    // Scan every (job, sample, query interval) in parallel. Scoped so the
+    // borrow of `plans` ends before its junctions are consumed below.
+    {
+        let ctx = ScanContext {
+            all_spans: &all_spans,
+            tsv_writer: &tsv_writer,
+            fasta_writer: &fasta_writer,
+            options: scan_options,
+        };
+        let work: Vec<(&JobPlan, &BamSample, &GeneSpan)> = plans
+            .iter()
+            .flat_map(|plan| {
+                samples.iter().flat_map(move |sample| {
+                    plan.query_spans
+                        .iter()
+                        .map(move |span| (plan, sample, span))
+                })
+            })
+            .collect();
+        work.par_iter()
+            .try_for_each(|&(plan, sample, span)| process_span(sample, span, plan, &ctx))?;
+    }
 
     let fasta_writer = Arc::into_inner(fasta_writer)
         .ok_or_else(|| anyhow!("failed to reclaim FASTA writer"))?
@@ -141,11 +166,25 @@ pub fn run(args: Args) -> Result<()> {
         output_fasta.display()
     );
 
-    if let (Some(vcf_path), Some(junctions)) = (output_vcf.as_ref(), junctions) {
-        let junctions = junctions
-            .into_inner()
-            .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
-        let mut variants = cluster_consensus(junctions, args.sv_slop);
+    if let Some(vcf_path) = output_vcf.as_ref() {
+        // Cluster each job's junctions with that job's own tolerance, then
+        // combine the calls and order them for a tidy VCF.
+        let mut variants: Vec<StructuralVariant> = Vec::new();
+        for plan in plans {
+            if let Some(collector) = plan.junctions {
+                let junctions = collector
+                    .into_inner()
+                    .map_err(|_| anyhow!("junction collector lock was poisoned"))?;
+                variants.extend(cluster_consensus(junctions, plan.slop));
+            }
+        }
+        variants.sort_by(|a, b| {
+            a.chrom1
+                .cmp(&b.chrom1)
+                .then(a.pos1.cmp(&b.pos1))
+                .then(a.chrom2.cmp(&b.chrom2))
+                .then(a.pos2.cmp(&b.pos2))
+        });
 
         // Depth is only knowable once the consensus breakpoint is fixed, so it
         // is measured here rather than during the streaming scan. Each sample
@@ -303,7 +342,7 @@ fn union_contigs(samples: &[BamSample]) -> Vec<(String, Option<usize>)> {
 fn resolve_output_path(
     explicit: Option<&Path>,
     samples: &[BamSample],
-    args: &Args,
+    genes_token: &str,
     extension: &str,
 ) -> PathBuf {
     if let Some(path) = explicit {
@@ -313,8 +352,21 @@ fn resolve_output_path(
     let paths: Vec<PathBuf> = samples.iter().map(|sample| sample.path.clone()).collect();
     let names: Vec<String> = samples.iter().map(|sample| sample.name.clone()).collect();
     let bam_token = bam_basename_token(&paths, &names);
-    let genes_token = genes_basename_token(&args.genes, args.partner_gene.as_deref());
-    default_output_path(&bam_token, &genes_token, extension)
+    default_output_path(&bam_token, genes_token, extension)
+}
+
+/// The gene component of default output names: the requested genes in single
+/// mode, or the loci file stem in batch mode.
+fn output_genes_token(args: &Args) -> String {
+    match &args.loci {
+        Some(path) => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(sanitize_token)
+            .filter(|token| !token.is_empty())
+            .unwrap_or_else(|| "loci".to_string()),
+        None => genes_basename_token(&args.genes, args.partner_gene.as_deref()),
+    }
 }
 
 fn default_output_path(bam_token: &str, genes_token: &str, extension: &str) -> PathBuf {
@@ -546,16 +598,111 @@ fn has_associated_index(bam_path: &Path) -> bool {
 
 /// Shared, read-only state for scanning gene spans: where results go and how
 /// records are filtered. Held once per run and borrowed by every worker.
-struct SpanScan<'a> {
-    partner_spans: Option<&'a [GeneSpan]>,
-    require_partner_match: bool,
+/// One unit of work: query genes, an optional partner constraint, and the
+/// clustering tolerance for the calls it produces. Single-CLI mode is one job;
+/// `--loci` mode is one per row.
+struct Job {
+    query_genes: Vec<String>,
+    partner_gene: Option<String>,
+    slop: usize,
+}
+
+/// A job with its annotation spans resolved and its own junction collector,
+/// ready to scan.
+struct JobPlan {
+    query_spans: Vec<GeneSpan>,
+    /// Spans the partner side is restricted to; `None` annotates against every
+    /// span (the `--partner-gene`-omitted behaviour) and requires no match.
+    partner_filter: Option<Vec<GeneSpan>>,
+    slop: usize,
+    junctions: Option<Mutex<Vec<Junction>>>,
+}
+
+/// Scan-wide state shared by every worker, independent of the job.
+struct ScanContext<'a> {
+    all_spans: &'a [GeneSpan],
     tsv_writer: &'a Arc<Mutex<BufWriter<File>>>,
     fasta_writer: &'a Arc<Mutex<FastaWriter>>,
-    junctions: Option<&'a Mutex<Vec<Junction>>>,
     options: ScanOptions,
 }
 
-fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Result<()> {
+fn build_jobs(args: &Args) -> Result<Vec<Job>> {
+    match &args.loci {
+        Some(path) => {
+            let requests = crate::loci::parse_loci_file(path)?;
+            info!(
+                "loaded {} locus job(s) from {}",
+                requests.len(),
+                path.display()
+            );
+            Ok(requests
+                .into_iter()
+                .map(|request| Job {
+                    query_genes: vec![request.gene],
+                    partner_gene: request.partner,
+                    slop: request.tolerance.unwrap_or(args.sv_slop),
+                })
+                .collect())
+        }
+        None => Ok(vec![Job {
+            query_genes: args.genes.clone(),
+            partner_gene: args.partner_gene.clone(),
+            slop: args.sv_slop,
+        }]),
+    }
+}
+
+/// Every gene named across the jobs, query and partner sides both.
+fn referenced_genes(jobs: &[Job]) -> Vec<String> {
+    let mut names = Vec::new();
+    for job in jobs {
+        names.extend(job.query_genes.iter().cloned());
+        if let Some(partner) = &job.partner_gene {
+            names.push(partner.clone());
+        }
+    }
+    names
+}
+
+fn build_job_plan(job: &Job, all_spans: &[GeneSpan], collect_junctions: bool) -> JobPlan {
+    let query_spans = filter_spans_by_gene_names(all_spans, &job.query_genes);
+    for gene in &job.query_genes {
+        if !query_spans
+            .iter()
+            .any(|span| span.gene.eq_ignore_ascii_case(gene))
+        {
+            warn!("gene {gene:?} has no intervals in the annotation; it will produce no output");
+        }
+    }
+
+    let partner_filter = resolve_partner_filter(all_spans, job.partner_gene.as_deref());
+    let junctions = collect_junctions.then(|| Mutex::new(Vec::<Junction>::new()));
+
+    JobPlan {
+        query_spans,
+        partner_filter,
+        slop: job.slop,
+        junctions,
+    }
+}
+
+/// Restrict partner annotation to a named gene, or `None` to annotate against
+/// every span.
+fn resolve_partner_filter(
+    all_spans: &[GeneSpan],
+    partner_gene: Option<&str>,
+) -> Option<Vec<GeneSpan>> {
+    partner_gene.map(|partner| {
+        filter_spans_by_gene_names(all_spans, std::slice::from_ref(&partner.to_string()))
+    })
+}
+
+fn process_span(
+    sample: &BamSample,
+    span: &GeneSpan,
+    plan: &JobPlan,
+    ctx: &ScanContext<'_>,
+) -> Result<()> {
     debug!(
         sample = sample.name,
         gene = span.gene,
@@ -569,6 +716,10 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
         .build_from_path(&sample.path)
         .with_context(|| format!("failed to open indexed BAM {}", sample.path.display()))?;
 
+    // A job without a partner filter annotates against every span.
+    let partner_spans = plan.partner_filter.as_deref().unwrap_or(ctx.all_spans);
+    let require_partner_match = plan.partner_filter.is_some();
+
     let region = build_region(span)?;
     let query = reader.query(&sample.header, &region)?;
     for result in query.records() {
@@ -577,23 +728,23 @@ fn process_span(sample: &BamSample, span: &GeneSpan, scan: &SpanScan<'_>) -> Res
             &sample.header,
             &sample.name,
             span,
-            scan.partner_spans,
-            scan.require_partner_match,
+            Some(partner_spans),
+            require_partner_match,
             &record,
-            scan.options,
+            ctx.options,
         );
 
         for (index, hit) in hits.into_iter().enumerate() {
-            write_tsv_row(scan.tsv_writer, &hit)?;
+            write_tsv_row(ctx.tsv_writer, &hit)?;
 
             // One FASTA record per read: a chimeric read supporting several
             // junctions gets one row per junction in the TSV, but its sequence
             // is written once. The header describes the first junction.
             if index == 0 {
-                write_fasta_record(scan.fasta_writer, &hit.fasta_header, &sequence)?;
+                write_fasta_record(ctx.fasta_writer, &hit.fasta_header, &sequence)?;
             }
 
-            if let Some(collector) = scan.junctions {
+            if let Some(collector) = &plan.junctions {
                 collector
                     .lock()
                     .map_err(|_| anyhow!("junction collector lock was poisoned"))?
@@ -876,30 +1027,6 @@ fn reference_name_for_id(header: &sam::Header, id: usize) -> Option<String> {
         .map(|(name, _)| String::from_utf8_lossy(name.as_ref()).into_owned())
 }
 
-fn requested_gene_names(args: &Args) -> Vec<String> {
-    let mut genes = args.genes.clone();
-
-    if let Some(partner_gene) = &args.partner_gene {
-        genes.push(partner_gene.clone());
-    }
-
-    genes
-}
-
-fn query_spans(all_spans: &[GeneSpan], args: &Args) -> Vec<GeneSpan> {
-    filter_spans_by_gene_names(all_spans, &args.genes)
-}
-
-fn partner_spans(all_spans: &[GeneSpan], args: &Args) -> Option<Vec<GeneSpan>> {
-    match args.partner_gene.as_ref() {
-        Some(partner_gene) => Some(filter_spans_by_gene_names(
-            all_spans,
-            std::slice::from_ref(partner_gene),
-        )),
-        None => Some(all_spans.to_vec()),
-    }
-}
-
 fn filter_spans_by_gene_names(all_spans: &[GeneSpan], names: &[String]) -> Vec<GeneSpan> {
     let wanted: Vec<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
 
@@ -1131,11 +1258,10 @@ mod tests {
     use super::{
         bam_basename_token, check_unique_sample_names, default_output_path,
         estimate_sa_breakpoint_position, filter_spans_by_gene_names, find_overlapping_span,
-        genes_basename_token, has_bam_extension, parse_sa_entries, partner_spans,
-        resolve_bam_inputs, sample_name, sanitize_token,
+        genes_basename_token, has_bam_extension, parse_sa_entries, resolve_bam_inputs,
+        resolve_partner_filter, sample_name, sanitize_token,
     };
     use crate::annotation::{Exon, GeneSpan, Transcript};
-    use crate::cli::Args;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1360,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_all_annotation_spans_when_partner_gene_is_not_provided() {
+    fn partner_filter_is_none_without_a_partner_gene() {
         let spans = vec![
             GeneSpan {
                 gene: "BCR".to_string(),
@@ -1380,29 +1506,14 @@ mod tests {
             },
         ];
 
-        let args = Args {
-            bam: vec![PathBuf::from("sample.bam")],
-            annotation: PathBuf::from("genes.gtf"),
-            genes: vec!["BCR".to_string()],
-            partner_gene: None,
-            output_tsv: None,
-            output_fasta: None,
-            output_vcf: None,
-            sv_slop: 10,
-            include_duplicates: false,
-            min_mapq: 0,
-            min_depth: 0,
-            threads: 1,
-            verbose: false,
-            log_file: None,
-        };
+        // No partner gene => no filter, so the partner side is annotated against
+        // every span.
+        assert!(resolve_partner_filter(&spans, None).is_none());
 
-        let partners = partner_spans(&spans, &args).unwrap();
-        assert_eq!(partners.len(), 2);
-        assert_eq!(
-            find_overlapping_span(&partners, "chr9", 350).map(|span| span.gene.clone()),
-            Some("ABL1".to_string())
-        );
+        // A partner gene restricts the partner side to that gene's spans.
+        let filtered = resolve_partner_filter(&spans, Some("ABL1")).expect("a filter");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].gene, "ABL1");
     }
 
     #[test]
@@ -1429,48 +1540,5 @@ mod tests {
         let filtered = filter_spans_by_gene_names(&spans, &["BCR".to_string()]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].gene, "BCR");
-    }
-
-    #[test]
-    fn does_not_add_partner_gene_to_query_spans() {
-        let spans = vec![
-            GeneSpan {
-                gene: "BCR".to_string(),
-                reference_name: "chr22".to_string(),
-                start: 100,
-                end: 200,
-                strand: Some('+'),
-                transcripts: vec![],
-            },
-            GeneSpan {
-                gene: "ABL1".to_string(),
-                reference_name: "chr9".to_string(),
-                start: 300,
-                end: 450,
-                strand: Some('+'),
-                transcripts: vec![],
-            },
-        ];
-
-        let args = Args {
-            bam: vec![PathBuf::from("sample.bam")],
-            annotation: PathBuf::from("genes.gtf"),
-            genes: vec!["BCR".to_string()],
-            partner_gene: Some("ABL1".to_string()),
-            output_tsv: None,
-            output_fasta: None,
-            output_vcf: None,
-            sv_slop: 10,
-            include_duplicates: false,
-            min_mapq: 0,
-            min_depth: 0,
-            threads: 1,
-            verbose: false,
-            log_file: None,
-        };
-
-        let queries = super::query_spans(&spans, &args);
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].gene, "BCR");
     }
 }

@@ -628,6 +628,203 @@ fn min_depth_drops_thinly_covered_calls() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn vcf_record_count(vcf: &str) -> usize {
+    vcf.lines().filter(|line| !line.starts_with('#')).count()
+}
+
+#[test]
+fn loci_batch_honours_per_row_tolerance_and_partner() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("scatter.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+
+    write_annotation(&annotation_path)?;
+    // Three BCR->ABL1 reads whose breakpoints scatter ~11 bp.
+    write_indexed_scattered_bam(&bam_path)?;
+
+    let run = |loci_body: &str, tag: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let loci = fixture_dir.join(format!("{tag}.loci"));
+        fs::write(&loci, loci_body)?;
+        let vcf = fixture_dir.join(format!("{tag}.vcf"));
+        let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+            .arg("--bam")
+            .arg(&bam_path)
+            .arg("--annotation")
+            .arg(&annotation_path)
+            .arg("--loci")
+            .arg(&loci)
+            .arg("--output-tsv")
+            .arg(fixture_dir.join(format!("{tag}.tsv")))
+            .arg("--output-fasta")
+            .arg(fixture_dir.join(format!("{tag}.fasta.gz")))
+            .arg("--output-vcf")
+            .arg(&vcf)
+            .arg("--threads")
+            .arg("1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stellerator failed\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read_to_string(&vcf)?)
+    };
+
+    // A tight per-row tolerance splits the scattered reads into several calls;
+    // the global default (200) would have merged them into one, so this proves
+    // the file's tolerance is what drives clustering.
+    let tight = run("BCR\tABL1\t5\n", "tight")?;
+    assert!(
+        vcf_record_count(&tight) >= 2,
+        "tolerance 5 should fragment the cluster\n{tight}"
+    );
+
+    // A generous per-row tolerance merges them into a single call.
+    let generous = run("BCR\tABL1\t200\n", "generous")?;
+    assert_eq!(
+        vcf_record_count(&generous),
+        1,
+        "tolerance 200 should merge the cluster\n{generous}"
+    );
+
+    // The partner from the row is applied: every call is BCR -> ABL1.
+    for record in generous.lines().filter(|line| !line.starts_with('#')) {
+        assert!(record.contains("GENE1=BCR"), "{record}");
+        assert!(record.contains("GENE2=ABL1"), "{record}");
+    }
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn loci_batch_aggregates_independent_jobs() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("scatter.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let loci_path = fixture_dir.join("panel.loci");
+    let output_vcf = fixture_dir.join("panel.vcf");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_scattered_bam(&bam_path)?;
+    // Two independent jobs over the same gene: one constrained to ABL1, one
+    // unconstrained. Each clusters its own junctions, so both contribute a call.
+    fs::write(&loci_path, "BCR\tABL1\t200\nBCR\t-\t200\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--loci")
+        .arg(&loci_path)
+        .arg("--output-tsv")
+        .arg(fixture_dir.join("panel.tsv"))
+        .arg("--output-fasta")
+        .arg(fixture_dir.join("panel.fasta.gz"))
+        .arg("--output-vcf")
+        .arg(&output_vcf)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "stellerator failed\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let vcf = fs::read_to_string(&output_vcf)?;
+    assert_eq!(
+        vcf_record_count(&vcf),
+        2,
+        "each job should contribute one call\n{vcf}"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn loci_batch_derives_output_names_from_loci_file() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let bam_path = fixture_dir.join("scatter.bam");
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let loci_path = fixture_dir.join("panel.loci");
+
+    write_annotation(&annotation_path)?;
+    write_indexed_scattered_bam(&bam_path)?;
+    fs::write(&loci_path, "BCR\tABL1\t50\n")?;
+
+    // No --output-* flags: names derive from the BAM stem and the loci stem.
+    let output = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .current_dir(&fixture_dir)
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--loci")
+        .arg(&loci_path)
+        .arg("--threads")
+        .arg("1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "stellerator failed\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        fixture_dir.join("scatter.panel.tsv").exists(),
+        "expected <bam>.<loci-stem>.tsv"
+    );
+    assert!(fixture_dir.join("scatter.panel.fasta.gz").exists());
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
+#[test]
+fn rejects_gene_and_loci_together() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture_dir = unique_fixture_dir()?;
+    let annotation_path = fixture_dir.join("genes.gff3");
+    let bam_path = fixture_dir.join("fusion.bam");
+    let loci_path = fixture_dir.join("panel.loci");
+    write_annotation(&annotation_path)?;
+    write_indexed_bam(&bam_path, "fusion-read-1")?;
+    fs::write(&loci_path, "BCR ABL1 10\n")?;
+
+    // Both --gene and --loci: clap rejects the combination.
+    let both = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .arg("--gene")
+        .arg("BCR")
+        .arg("--loci")
+        .arg(&loci_path)
+        .output()?;
+    assert!(
+        !both.status.success(),
+        "--gene with --loci must be rejected"
+    );
+
+    // Neither: one of them is required.
+    let neither = Command::new(env!("CARGO_BIN_EXE_stellerator"))
+        .arg("--bam")
+        .arg(&bam_path)
+        .arg("--annotation")
+        .arg(&annotation_path)
+        .output()?;
+    assert!(
+        !neither.status.success(),
+        "either --gene or --loci is required"
+    );
+
+    fs::remove_dir_all(fixture_dir)?;
+    Ok(())
+}
+
 fn write_annotation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         path,

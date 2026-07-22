@@ -2,6 +2,26 @@
 
 Notable changes to Stellerator. Versions follow [Semantic Versioning](https://semver.org/).
 
+## 0.3.0
+
+### Added
+
+- Batch mode via `--loci FILE`: process many gene pairs in one run, each with
+  its own partner constraint and clustering tolerance. The file has one job per
+  line (`gene [partner] [tolerance]`, whitespace-separated); `#` comments, blank
+  lines, and an optional header are ignored; a `-`/`.`/`NA`/absent partner means
+  "annotate against any overlapping gene"; an absent tolerance falls back to
+  `--sv-slop`. All jobs aggregate into one TSV/FASTA/VCF, and each job's calls
+  are clustered with its own tolerance. `--loci` is mutually exclusive with
+  `--gene`, and `--partner-gene` is ignored (each row carries its own).
+
+### Changed
+
+- `--sv-slop` now defaults to 200 bp (was 10), tuned for long-read data whose
+  breakpoints scatter more than short reads. Pass `--sv-slop` to override.
+- A query gene that resolves to no annotation intervals now logs a warning
+  rather than silently producing nothing.
+
 ## 0.2.2
 
 ### Changed
