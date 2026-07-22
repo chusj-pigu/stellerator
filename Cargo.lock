@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Stellerator"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -85,9 +85,12 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "bit-vec"
-version = "0.8.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -232,7 +235,6 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
- "zlib-rs",
 ]
 
 [[package]]
@@ -356,9 +358,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-bam"
-version = "0.86.0"
+version = "0.91.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9414f553acb9c4285ecc31b83f52ee55ac5b806e432303af74dbcde38bd2094"
+checksum = "68aa8af90e253005bbb957a589da61d8966ea1453bb3c1122d53704ddaa5e93c"
 dependencies = [
  "bstr",
  "indexmap",
@@ -371,29 +373,30 @@ dependencies = [
 
 [[package]]
 name = "noodles-bgzf"
-version = "0.46.0"
+version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37290f565045fd2775b549e62dffca7e1afadc70d8d5a3a2ef19609eb3d8193b"
+checksum = "da1dbf501b46281ca402b458211653bc8c510ea605400a1192d272a35360aa54"
 dependencies = [
  "bytes",
  "crossbeam-channel",
- "flate2",
+ "rayon",
+ "zlib-rs",
 ]
 
 [[package]]
 name = "noodles-core"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53e1e8a419dbba0e4000b0e60830b124138c7f2277ad556463506f1a81d32d17"
+checksum = "c8dbac7c5f9a7de9fe45590f198a09697df631cd13d2060b4742cc48144555b0"
 dependencies = [
  "bstr",
 ]
 
 [[package]]
 name = "noodles-csi"
-version = "0.54.0"
+version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "348b39ee45de200280706b1152a082f847cd258eed13105441c80b8f6097b489"
+checksum = "56d2b47cd56d466c6b39d7d2d3f19905c786d5bbcf45c782af3c206129bb39b8"
 dependencies = [
  "bit-vec",
  "bstr",
@@ -404,9 +407,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-sam"
-version = "0.82.0"
+version = "0.86.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45df1c1b8939d136a9612f3b3721cafdf4627f2daf2754bb8e9cf5aca70a4c34"
+checksum = "2553a62c2a78d87686005327f2597a765ae55e10e2fd09015a54c0337676fbae"
 dependencies = [
  "bitflags",
  "bstr",
