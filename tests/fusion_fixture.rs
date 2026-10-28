@@ -24,6 +24,53 @@ use noodles_sam::{
 };
 
 #[test]
+fn rejects_output_collisions_before_truncating_files() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = unique_fixture_dir()?;
+    let bam = dir.join("sample.bam");
+    let annotation = dir.join("genes.gff3");
+    write_annotation(&annotation)?;
+    write_indexed_bam(&bam, "read")?;
+    let original_bam = fs::read(&bam)?;
+    let original_annotation = fs::read(&annotation)?;
+    let index = dir.join("sample.bam.bai");
+    let original_index = fs::read(&index)?;
+    let shared = dir.join("shared.out");
+    let hardlink = dir.join("annotation-link");
+    fs::hard_link(&annotation, &hardlink)?;
+
+    for (flag, target, extra) in [
+        ("--output-tsv", &bam, None),
+        ("--output-fasta", &annotation, None),
+        ("--output-vcf", &index, None),
+        ("--log-file", &hardlink, None),
+        ("--output-tsv", &shared, Some(("--output-fasta", &shared))),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stellerator"));
+        command
+            .arg("--bam")
+            .arg(&bam)
+            .arg("--annotation")
+            .arg(&annotation)
+            .arg("--gene")
+            .arg("BCR")
+            .arg(flag)
+            .arg(target);
+        if let Some((other_flag, other_path)) = extra {
+            command.arg(other_flag).arg(other_path);
+        }
+        let output = command.output()?;
+        assert!(!output.status.success(), "collision accepted for {flag}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with"));
+        assert_eq!(fs::read(&bam)?, original_bam);
+        assert_eq!(fs::read(&annotation)?, original_annotation);
+        assert_eq!(fs::read(&index)?, original_index);
+    }
+    assert!(!shared.exists());
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn extracts_fusion_read_and_infers_partner_annotation() -> Result<(), Box<dyn std::error::Error>> {
     let fixture_dir = unique_fixture_dir()?;
     let bam_path = fixture_dir.join("fusion.bam");
